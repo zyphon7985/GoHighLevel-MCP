@@ -560,7 +560,7 @@ async function executeTool(name, args) {
         conversationId = newConv.conversation?.id || newConv.id;
       }
       return ghlRequest('/conversations/messages', 'POST', {
-        type: 'SMS', conversationId, message: args.message
+        type: 'SMS', conversationId, contactId: args.contactId, message: args.message
       });
     }
 
@@ -618,15 +618,17 @@ async function executeTool(name, args) {
       };
       if (convContactId) payload.contactId = convContactId;
       if (args.type === 'Email') {
-        // Also fetch contact email for emailTo
+        // GHL requires html field for email body, not message
+        payload.html = args.html || args.message;
         if (convContactId) {
           const convContact = await ghlRequest(`/contacts/${convContactId}`);
           const emailAddr = convContact?.contact?.email || convContact?.email;
           if (emailAddr) payload.emailTo = emailAddr;
         }
+      } else if (args.html) {
+        payload.html = args.html;
       }
       if (args.subject) payload.subject = args.subject;
-      if (args.html) payload.html = args.html;
       return ghlRequest('/conversations/messages', 'POST', payload);
     }
 
@@ -681,6 +683,7 @@ async function executeTool(name, args) {
     case 'create_appointment': {
       const apptPayload = {
         calendarId: args.calendarId,
+        locationId: GHL_LOCATION_ID,
         contactId: args.contactId,
         startTime: args.startTime,
         endTime: args.endTime,
