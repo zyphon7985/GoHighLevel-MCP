@@ -650,14 +650,16 @@ async function executeTool(name, args) {
       return ghlRequest(`/calendars/?locationId=${GHL_LOCATION_ID}`);
 
     case 'get_calendar_appointments': {
-      let url = `/calendars/${args.calendarId}/appointments?locationId=${GHL_LOCATION_ID}`;
-      url += `&startDate=${encodeURIComponent(args.startDate)}`;
-      url += `&endDate=${encodeURIComponent(args.endDate)}`;
+      // GHL v2 uses /calendars/events with epoch timestamps
+      const startEpoch = new Date(args.startDate).getTime();
+      const endEpoch = new Date(args.endDate).getTime();
+      let url = `/calendars/events?locationId=${GHL_LOCATION_ID}&calendarId=${args.calendarId}`;
+      url += `&startTime=${startEpoch}&endTime=${endEpoch}`;
       return ghlRequest(url);
     }
 
     case 'get_appointment':
-      return ghlRequest(`/appointments/${args.appointmentId}`);
+      return ghlRequest(`/calendars/events/appointments/${args.appointmentId}`);
 
     case 'create_appointment': {
       const apptPayload = {
@@ -669,12 +671,12 @@ async function executeTool(name, args) {
         status: args.status || 'confirmed'
       };
       if (args.notes) apptPayload.notes = args.notes;
-      return ghlRequest('/appointments/', 'POST', apptPayload);
+      return ghlRequest('/calendars/events/appointments', 'POST', apptPayload);
     }
 
     case 'update_appointment': {
       const { appointmentId, ...apptData } = args;
-      return ghlRequest(`/appointments/${appointmentId}`, 'PUT', apptData);
+      return ghlRequest(`/calendars/events/appointments/${appointmentId}`, 'PUT', apptData);
     }
 
     case 'get_contact_appointments':
