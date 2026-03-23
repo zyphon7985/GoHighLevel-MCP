@@ -582,7 +582,11 @@ async function executeTool(name, args) {
     }
 
     case 'send_email': {
-      // Find or create conversation for the contact
+      // Look up contact to get email address (GHL requires emailTo explicitly)
+      const contact = await ghlRequest(`/contacts/${args.contactId}`);
+      const emailTo = contact?.contact?.email || contact?.email;
+      if (!emailTo) throw new Error('Contact has no email address on file');
+      // Find or create conversation
       const convSearch = await ghlRequest(`/conversations/search?locationId=${GHL_LOCATION_ID}&contactId=${args.contactId}`);
       let conversationId = convSearch.conversations?.[0]?.id;
       if (!conversationId) {
@@ -594,6 +598,8 @@ async function executeTool(name, args) {
       const payload = {
         type: 'Email',
         conversationId,
+        contactId: args.contactId,
+        emailTo,
         message: args.message,
         subject: args.subject
       };
@@ -603,11 +609,23 @@ async function executeTool(name, args) {
     }
 
     case 'send_message': {
+      // Look up conversation to get contactId (required by GHL for email sends)
+      const conv = await ghlRequest(`/conversations/${args.conversationId}`);
+      const convContactId = conv?.conversation?.contactId || conv?.contactId;
       const payload = {
         type: args.type,
         conversationId: args.conversationId,
         message: args.message
       };
+      if (convContactId) payload.contactId = convContactId;
+      if (args.type === 'Email') {
+        // Also fetch contact email for emailTo
+        if (convContactId) {
+          const convContact = await ghlRequest(`/contacts/${convContactId}`);
+          const emailAddr = convContact?.contact?.email || convContact?.email;
+          if (emailAddr) payload.emailTo = emailAddr;
+        }
+      }
       if (args.subject) payload.subject = args.subject;
       if (args.html) payload.html = args.html;
       return ghlRequest('/conversations/messages', 'POST', payload);
