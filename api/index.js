@@ -600,10 +600,9 @@ async function executeTool(name, args) {
         conversationId,
         contactId: args.contactId,
         emailTo,
-        message: args.message,
+        html: args.html || args.message,
         subject: args.subject
       };
-      if (args.html) payload.html = args.html;
       if (args.emailFrom) payload.emailFrom = args.emailFrom;
       return ghlRequest('/conversations/messages', 'POST', payload);
     }
@@ -655,8 +654,8 @@ async function executeTool(name, args) {
       return ghlRequest(`/contacts/${args.contactId}/tasks`);
 
     case 'create_contact_task': {
-      const taskPayload = { title: args.title };
-      if (args.description) taskPayload.description = args.description;
+      const taskPayload = { title: args.title, completed: false };
+      if (args.description) taskPayload.body = args.description;
       if (args.dueDate) taskPayload.dueDate = args.dueDate;
       if (args.assignedTo) taskPayload.assignedTo = args.assignedTo;
       return ghlRequest(`/contacts/${args.contactId}/tasks`, 'POST', taskPayload);
