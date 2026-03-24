@@ -90,6 +90,7 @@ const TOOLS = [
         email: { type: 'string' },
         phone: { type: 'string' },
         tags: { type: 'array', items: { type: 'string' } },
+        companyName: { type: 'string', description: 'Native GHL company name field (companyName on contact record)' },
         customFields: { type: 'array', items: { type: 'object', properties: { key: { type: 'string' }, field_value: { type: 'string' } } }, description: 'Custom field values as [{key, field_value}]' }
       },
       required: ['contactId']
@@ -722,8 +723,13 @@ async function executeTool(name, args) {
     }
 
     case 'update_custom_field_values': {
+      // Map empty string field_value → null so GHL actually clears the field
+      const processedFields = args.customFields.map(f => ({
+        ...f,
+        field_value: (f.field_value === '' || f.field_value === '__CLEAR__') ? null : f.field_value
+      }));
       return ghlRequest(`/contacts/${args.contactId}`, 'PUT', {
-        customFields: args.customFields
+        customFields: processedFields
       });
     }
 
