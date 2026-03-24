@@ -1,13 +1,17 @@
-// GoHighLevel MCP Server v2.0 — Full API Integration
+// GoHighLevel MCP Server v2.1 — Full API Integration + Fullenrich Enrichment
 // Built for Claude/Cowork via Vercel serverless
-// Expanded: Messages, Workflows, Notes, Tasks, Calendar, Pagination, Custom Fields
+// Expanded: Messages, Workflows, Notes, Tasks, Calendar, Pagination, Custom Fields, Enrichment
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 const GHL_BASE_URL = process.env.GHL_BASE_URL || 'https://services.leadconnectorhq.com';
 const GHL_VERSION = '2021-07-28';
 const MCP_PROTOCOL_VERSION = '2024-11-05';
-const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.0.0' };
+const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.1.0' };
+
+// ─── Fullenrich API Config ──────────────────────────────────────────────────────
+const FULLENRICH_API_KEY = process.env.FULLENRICH_API_KEY;
+const FULLENRICH_BASE_URL = 'https://app.fullenrich.com/api/v1';
 
 // ─── GHL API Helper ───────────────────────────────────────────────────────────
 
@@ -24,6 +28,24 @@ async function ghlRequest(endpoint, method = 'GET', body = null) {
   const response = await fetch(url, options);
   const text = await response.text();
   if (!response.ok) throw new Error(`GHL API ${response.status}: ${text}`);
+  return text ? JSON.parse(text) : {};
+}
+
+// ─── Fullenrich API Helper ────────────────────────────────────────────────────
+
+async function fullenrichRequest(endpoint, method = 'GET', body = null) {
+  if (!FULLENRICH_API_KEY) throw new Error('FULLENRICH_API_KEY not configured in environment variables');
+  const url = `${FULLENRICH_BASE_URL}${endpoint}`;
+  const headers = {
+    'Authorization': `Bearer ${FULLENRICH_API_KEY}`,
+    'Content-Type': 'application/json',
+    'Accept': 'application/json'
+  };
+  const options = { method, headers };
+  if (body) options.body = JSON.stringify(body);
+  const response = await fetch(url, options);
+  const text = await response.text();
+  if (!response.ok) throw new Error(`Fullenrich API ${response.status}: ${text}`);
   return text ? JSON.parse(text) : {};
 }
 
@@ -516,6 +538,57 @@ const TOOLS = [
       },
       required: ['formId']
     }
+  },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // FULLENRICH — Lead Enrichment
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  {
+    name: 'fullenrich_submit_batch',
+    description: 'Submit a batch of contacts to Fullenrich for enrichment. Returns an enrichment_id to poll for results. Each contact needs firstname, lastname, and either domain or company_name. Pass ghl_contact_id in each contact to map results back to GHL. Max 100 contacts per batch.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        batch_name: { type: 'string', description: 'Human-readable name for this enrichment batch (e.g. "TerraGenie IBS Leads March 2026")' },
+        contacts: {
+          type: 'array',
+          description: 'Array of contacts to enrich (max 100)',
+          items: {
+            type: 'object',
+            properties: {
+              firstname: { type: 'string', description: 'Contact first name (required)' },
+              lastname: { type: 'string', description: 'Contact last name (required)' },
+              domain: { type: 'string', description: 'Company domain (e.g. acme.com). Provide this OR company_name.' },
+              company_name: { type: 'string', description: 'Company name. Provide this OR domain.' },
+              linkedin_url: { type: 'string', description: 'LinkedIn profile URL (optional, improves match rate)' },
+              ghl_contact_id: { type: 'string', description: 'GHL contact ID for mapping results back (stored in custom field)' }
+            },
+            required: ['firstname', 'lastname']
+          }
+        }
+      },
+      required: ['batch_name', 'contacts']
+    }
+  },
+  {
+    name: 'fullenrich_get_results',
+    description: 'Get results for a Fullenrich enrichment batch by enrichment_id. Call this after submitting a batch to check status and retrieve enriched data (emails, phones, job titles, company info). Results may not be ready immediately — Fullenrich runs a waterfall across 15+ providers. If status is not complete, wait and poll again.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        enrichment_id: { type: 'string', description: 'The enrichment_id returned by fullenrich_submit_batch' }
+      },
+      required: ['enrichment_id']
+    }
+  },
+  {
+    name: 'fullenrich_check_credits',
+    description: 'Check remaining Fullenrich credit balance before running enrichment. 1 credit = 1 email find, 10 credits = 1 mobile phone, 3 credits = 1 personal email.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
   }
 ];
 
@@ -772,6 +845,34 @@ async function executeTool(name, args) {
       if (args.startAfterId) url += `&startAfterId=${args.startAfterId}`;
       return ghlRequest(url);
     }
+
+    // ── Fullenrich Enrichment ─────────────────────────────────────────────────
+
+    case 'fullenrich_submit_batch': {
+      const payload = {
+        name: args.batch_name,
+        datas: args.contacts.map(c => {
+          const entry = {
+            firstname: c.firstname,
+            lastname: c.lastname,
+            enrich_fields: ['contact.emails', 'contact.phones']
+          };
+          if (c.domain) entry.domain = c.domain;
+          if (c.company_name) entry.company_name = c.company_name;
+          if (c.linkedin_url) entry.linkedin_url = c.linkedin_url;
+          // Store GHL contact ID in custom field so we can map results back
+          if (c.ghl_contact_id) entry.custom = { ghl_contact_id: c.ghl_contact_id };
+          return entry;
+        })
+      };
+      return fullenrichRequest('/contact/enrich/bulk', 'POST', payload);
+    }
+
+    case 'fullenrich_get_results':
+      return fullenrichRequest(`/contact/enrich/bulk/${args.enrichment_id}`);
+
+    case 'fullenrich_check_credits':
+      return fullenrichRequest('/account/credits');
 
     default:
       throw new Error(`Unknown tool: ${name}`);
