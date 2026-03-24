@@ -434,7 +434,8 @@ const TOOLS = [
       properties: {
         query: { type: 'string', description: 'Search term (optional for browsing all)' },
         limit: { type: 'number', description: 'Results per page (max 100, default 100)' },
-        startAfterId: { type: 'string', description: 'Cursor — last contact ID from previous page' }
+        startAfterId: { type: 'string', description: 'Cursor — last contact ID from previous page (use with startAfter)' },
+        startAfter: { type: 'number', description: 'Timestamp cursor from meta.startAfter in previous response (required alongside startAfterId for page 2+)' }
       }
     }
   },
@@ -708,6 +709,7 @@ async function executeTool(name, args) {
     case 'search_contacts_paginated': {
       let url = `/contacts/?locationId=${GHL_LOCATION_ID}&limit=${args.limit || 100}`;
       if (args.query) url += `&query=${encodeURIComponent(args.query)}`;
+      if (args.startAfter) url += `&startAfter=${args.startAfter}`;
       if (args.startAfterId) url += `&startAfterId=${args.startAfterId}`;
       return ghlRequest(url);
     }
