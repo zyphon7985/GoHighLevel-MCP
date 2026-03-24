@@ -477,6 +477,29 @@ const TOOLS = [
     }
   },
   {
+    name: 'get_business',
+    description: 'Get a GHL Business object by businessId. Business objects are linked to contacts via businessId and their name field is what appears in the "Company name" column in the GHL contact list view.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        businessId: { type: 'string', description: 'The businessId from the contact record' }
+      },
+      required: ['businessId']
+    }
+  },
+  {
+    name: 'update_business',
+    description: 'Update a GHL Business object. Use this to update the name that appears in the "Company name" column of the GHL contact list view.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        businessId: { type: 'string', description: 'The businessId from the contact record' },
+        name: { type: 'string', description: 'The business name to set' }
+      },
+      required: ['businessId', 'name']
+    }
+  },
+  {
     name: 'get_forms',
     description: 'List all forms in this sub-account',
     inputSchema: { type: 'object', properties: {} }
@@ -734,6 +757,12 @@ async function executeTool(name, args) {
         customFields: processedFields
       });
     }
+
+    case 'get_business':
+      return ghlRequest(`/businesses/${args.businessId}`);
+
+    case 'update_business':
+      return ghlRequest(`/businesses/${args.businessId}`, 'PUT', { name: args.name });
 
     case 'get_forms':
       return ghlRequest(`/forms/?locationId=${GHL_LOCATION_ID}`);
