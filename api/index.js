@@ -2,13 +2,14 @@
 // Built for Claude/Cowork via Vercel serverless
 // Expanded: Messages, Workflows, Notes, Tasks, Calendar, Pagination, Custom Fields, Enrichment
 // v2.2: Full business object CRUD (create, read, update, list), opportunity custom fields
+// v2.3: Fixed custom field write formats — Contact/Opportunity use {id, field_value}, Business uses {"key": "value"} object
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 const GHL_BASE_URL = process.env.GHL_BASE_URL || 'https://services.leadconnectorhq.com';
 const GHL_VERSION = '2021-07-28';
 const MCP_PROTOCOL_VERSION = '2024-11-05';
-const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.2.0' };
+const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.3.0' };
 
 // ─── Fullenrich API Config ──────────────────────────────────────────────────────
 const FULLENRICH_API_KEY = process.env.FULLENRICH_API_KEY;
@@ -48,6 +49,40 @@ async function fullenrichRequest(endpoint, method = 'GET', body = null) {
   const text = await response.text();
   if (!response.ok) throw new Error(`Fullenrich API ${response.status}: ${text}`);
   return text ? JSON.parse(text) : {};
+}
+
+// ─── Custom Field Helpers ─────────────────────────────────────────────────────
+// GHL Contact API requires customFields as [{id, field_value}] — the "id" property is the field ID.
+// GHL Business API requires customFields as {"fieldKey": "value"} — an object, not an array.
+// Our tool interface accepts [{key, field_value}] where "key" can be either a field ID or fieldKey.
+// These helpers convert from our input format to what GHL expects.
+
+function toContactCustomFields(fields) {
+  // Convert [{key, field_value}] → [{id, field_value}]
+  // If "key" looks like a fieldKey (contains a dot), pass as "key"; otherwise pass as "id"
+  if (!fields || !fields.length) return undefined;
+  return fields.map(f => {
+    const val = (f.field_value === '' || f.field_value === '__CLEAR__') ? null : f.field_value;
+    const identifier = f.key || f.id;
+    if (identifier && identifier.includes('.')) {
+      // Looks like a fieldKey (e.g. "contact.decision_maker") — pass as key AND id
+      // GHL docs say id is required, so we pass identifier as id too for safety
+      return { id: identifier, key: identifier, field_value: val };
+    }
+    // Looks like a field ID — pass as id
+    return { id: identifier, field_value: val };
+  });
+}
+
+function toBusinessCustomFields(fields) {
+  // Convert [{key, field_value}] → {"fieldKey": "value"} object
+  if (!fields || !fields.length) return undefined;
+  const obj = {};
+  for (const f of fields) {
+    const fieldKey = f.key || f.id;
+    obj[fieldKey] = (f.field_value === '' || f.field_value === '__CLEAR__') ? null : f.field_value;
+  }
+  return obj;
 }
 
 // ─── Tool Definitions ─────────────────────────────────────────────────────────
@@ -554,7 +589,7 @@ const TOOLS = [
   },
   {
     name: 'create_business',
-    description: 'Create a new GHL Business object. After creation, link it to a contact by updating the contact with the returned businessId. Supports all standard fields plus custom fields for AI enrichment data.',
+    description: 'Create a new GHL Business object. After creation, link it to a contact by updating the contact with the returned businessId. Supports standard fields (name, phone, email, website, address, description) plus custom fields for AI enrichment data (ICP Score, Industry, Revenue Tier, etc.). Note: industry, employeeCount, annualRevenue are NOT standard Business API fields — use customFields for those.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -568,9 +603,6 @@ const TOOLS = [
         postalCode: { type: 'string', description: 'Postal/ZIP code' },
         country: { type: 'string', description: 'Country' },
         description: { type: 'string', description: 'Business description' },
-        industry: { type: 'string', description: 'Industry/vertical (e.g. "Construction", "Landscaping")' },
-        employeeCount: { type: 'number', description: 'Number of employees' },
-        annualRevenue: { type: 'number', description: 'Annual revenue in dollars' },
         tags: {
           type: 'array',
           items: { type: 'string' },
@@ -581,12 +613,11 @@ const TOOLS = [
           items: {
             type: 'object',
             properties: {
-              id: { type: 'string', description: 'Custom field ID (from get_location_custom_fields)' },
-              key: { type: 'string', description: 'Custom field key (alternative to id)' },
+              key: { type: 'string', description: 'Custom field key (e.g. "business.icp_score", "business.enrichment_status")' },
               field_value: { type: 'string', description: 'Value to set (use null or "__CLEAR__" to clear)' }
             }
           },
-          description: 'Custom field values — Company-model fields for AI enrichment (ICP Score, Revenue Tier, etc.)'
+          description: 'Custom field values as [{key, field_value}]. GHL Business API requires object format — this tool converts automatically. Use for: ICP Score, ICP Segment, Company Size Tier, Revenue Tier, Enrichment Status, Enrichment Date, Enrichment Source, Service Area, Year Founded.'
         }
       },
       required: ['name']
@@ -594,7 +625,7 @@ const TOOLS = [
   },
   {
     name: 'update_business',
-    description: 'Update a GHL Business object. Supports all standard fields (name, phone, email, website, address, industry, etc.) plus custom fields for AI enrichment data (ICP Score, Company Size Tier, Revenue Tier, Enrichment Status, etc.) and tags. Only sends fields that are provided — omitted fields are not changed.',
+    description: 'Update a GHL Business object. Supports standard fields (name, phone, email, website, address, description) plus custom fields for AI enrichment data (ICP Score, Company Size Tier, Revenue Tier, Enrichment Status, etc.) and tags. Only sends fields that are provided — omitted fields are not changed. Note: industry, employeeCount, annualRevenue must go through customFields, not as top-level properties.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -609,9 +640,6 @@ const TOOLS = [
         postalCode: { type: 'string', description: 'Postal/ZIP code' },
         country: { type: 'string', description: 'Country' },
         description: { type: 'string', description: 'Business description' },
-        industry: { type: 'string', description: 'Industry/vertical (e.g. "Construction", "Landscaping")' },
-        employeeCount: { type: 'number', description: 'Number of employees' },
-        annualRevenue: { type: 'number', description: 'Annual revenue in dollars' },
         tags: {
           type: 'array',
           items: { type: 'string' },
@@ -622,12 +650,11 @@ const TOOLS = [
           items: {
             type: 'object',
             properties: {
-              id: { type: 'string', description: 'Custom field ID (from get_location_custom_fields)' },
-              key: { type: 'string', description: 'Custom field key (alternative to id)' },
+              key: { type: 'string', description: 'Custom field key (e.g. "business.icp_score", "business.enrichment_status")' },
               field_value: { type: 'string', description: 'Value to set (use null or "__CLEAR__" to clear)' }
             }
           },
-          description: 'Custom field values — Company-model fields for AI enrichment (ICP Score, Revenue Tier, etc.)'
+          description: 'Custom field values as [{key, field_value}]. GHL Business API requires object format — this tool converts automatically. Use for: ICP Score, ICP Segment, Company Size Tier, Revenue Tier, Enrichment Status, Enrichment Date, Enrichment Source, Service Area, Year Founded.'
         }
       },
       required: ['businessId']
@@ -720,12 +747,20 @@ async function executeTool(name, args) {
     case 'get_contact':
       return ghlRequest(`/contacts/${args.contactId}`);
 
-    case 'create_contact':
-      return ghlRequest('/contacts/', 'POST', { ...args, locationId: GHL_LOCATION_ID });
+    case 'create_contact': {
+      const { customFields: ccFields, ...ccData } = args;
+      const ccPayload = { ...ccData, locationId: GHL_LOCATION_ID };
+      const convertedCc = toContactCustomFields(ccFields);
+      if (convertedCc) ccPayload.customFields = convertedCc;
+      return ghlRequest('/contacts/', 'POST', ccPayload);
+    }
 
     case 'update_contact': {
-      const { contactId, ...data } = args;
-      return ghlRequest(`/contacts/${contactId}`, 'PUT', data);
+      const { contactId, customFields: ucFields, ...ucData } = args;
+      const ucPayload = { ...ucData };
+      const convertedUc = toContactCustomFields(ucFields);
+      if (convertedUc) ucPayload.customFields = convertedUc;
+      return ghlRequest(`/contacts/${contactId}`, 'PUT', ucPayload);
     }
 
     case 'add_contact_tags':
@@ -746,12 +781,20 @@ async function executeTool(name, args) {
     case 'get_opportunity':
       return ghlRequest(`/opportunities/${args.opportunityId}`);
 
-    case 'create_opportunity':
-      return ghlRequest('/opportunities/', 'POST', { ...args, locationId: GHL_LOCATION_ID });
+    case 'create_opportunity': {
+      const { customFields: coFields, ...coData } = args;
+      const coPayload = { ...coData, locationId: GHL_LOCATION_ID };
+      const convertedCo = toContactCustomFields(coFields);
+      if (convertedCo) coPayload.customFields = convertedCo;
+      return ghlRequest('/opportunities/', 'POST', coPayload);
+    }
 
     case 'update_opportunity': {
-      const { opportunityId, ...data } = args;
-      return ghlRequest(`/opportunities/${opportunityId}`, 'PUT', data);
+      const { opportunityId, customFields: uoFields, ...uoData } = args;
+      const uoPayload = { ...uoData };
+      const convertedUo = toContactCustomFields(uoFields);
+      if (convertedUo) uoPayload.customFields = convertedUo;
+      return ghlRequest(`/opportunities/${opportunityId}`, 'PUT', uoPayload);
     }
 
     case 'search_conversations': {
@@ -933,13 +976,10 @@ async function executeTool(name, args) {
     }
 
     case 'update_custom_field_values': {
-      // Map empty string field_value → null so GHL actually clears the field
-      const processedFields = args.customFields.map(f => ({
-        ...f,
-        field_value: (f.field_value === '' || f.field_value === '__CLEAR__') ? null : f.field_value
-      }));
+      // Convert [{key, field_value}] → [{id, field_value}] for GHL Contact API
+      const convertedFields = toContactCustomFields(args.customFields);
       return ghlRequest(`/contacts/${args.contactId}`, 'PUT', {
-        customFields: processedFields
+        customFields: convertedFields
       });
     }
 
@@ -956,34 +996,31 @@ async function executeTool(name, args) {
 
     case 'create_business': {
       const { customFields: bizCustomFields, ...bizData } = args;
-      const createPayload = { ...bizData, locationId: GHL_LOCATION_ID };
-      // Process custom fields — handle __CLEAR__ → null
-      if (bizCustomFields && bizCustomFields.length > 0) {
-        createPayload.customFields = bizCustomFields.map(f => ({
-          ...f,
-          field_value: (f.field_value === '' || f.field_value === '__CLEAR__') ? null : f.field_value
-        }));
+      // Filter to only GHL-accepted standard fields (industry/employeeCount/annualRevenue are NOT accepted)
+      const createPayload = { locationId: GHL_LOCATION_ID };
+      const bizStandardFields = ['name', 'phone', 'email', 'website', 'address', 'city', 'state', 'postalCode', 'country', 'description', 'tags'];
+      for (const field of bizStandardFields) {
+        if (bizData[field] !== undefined) createPayload[field] = bizData[field];
       }
+      // GHL Business API expects customFields as OBJECT {"fieldKey": "value"}, not array
+      const bizCfObj = toBusinessCustomFields(bizCustomFields);
+      if (bizCfObj) createPayload.customFields = bizCfObj;
       return ghlRequest('/businesses/', 'POST', createPayload);
     }
 
     case 'update_business': {
       const { businessId, customFields: updateCustomFields, ...updateData } = args;
       const updatePayload = {};
-      // Only include fields that were actually provided (don't send undefined)
-      const standardFields = ['name', 'phone', 'email', 'website', 'address', 'city', 'state', 'postalCode', 'country', 'description', 'industry', 'employeeCount', 'annualRevenue', 'tags'];
+      // Only include GHL-accepted standard fields (industry/employeeCount/annualRevenue are NOT accepted)
+      const standardFields = ['name', 'phone', 'email', 'website', 'address', 'city', 'state', 'postalCode', 'country', 'description', 'tags'];
       for (const field of standardFields) {
         if (updateData[field] !== undefined) {
           updatePayload[field] = updateData[field];
         }
       }
-      // Process custom fields — handle __CLEAR__ → null
-      if (updateCustomFields && updateCustomFields.length > 0) {
-        updatePayload.customFields = updateCustomFields.map(f => ({
-          ...f,
-          field_value: (f.field_value === '' || f.field_value === '__CLEAR__') ? null : f.field_value
-        }));
-      }
+      // GHL Business API expects customFields as OBJECT {"fieldKey": "value"}, not array
+      const bizUpdateCfObj = toBusinessCustomFields(updateCustomFields);
+      if (bizUpdateCfObj) updatePayload.customFields = bizUpdateCfObj;
       return ghlRequest(`/businesses/${businessId}`, 'PUT', updatePayload);
     }
 
