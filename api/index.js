@@ -1,13 +1,14 @@
-// GoHighLevel MCP Server v2.1 — Full API Integration + Fullenrich Enrichment
+// GoHighLevel MCP Server v2.2 — Full API Integration + Fullenrich Enrichment + Business Object Writes
 // Built for Claude/Cowork via Vercel serverless
 // Expanded: Messages, Workflows, Notes, Tasks, Calendar, Pagination, Custom Fields, Enrichment
+// v2.2: Full business object CRUD (create, read, update, list), opportunity custom fields
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 const GHL_BASE_URL = process.env.GHL_BASE_URL || 'https://services.leadconnectorhq.com';
 const GHL_VERSION = '2021-07-28';
 const MCP_PROTOCOL_VERSION = '2024-11-05';
-const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.1.0' };
+const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.2.0' };
 
 // ─── Fullenrich API Config ──────────────────────────────────────────────────────
 const FULLENRICH_API_KEY = process.env.FULLENRICH_API_KEY;
@@ -160,7 +161,7 @@ const TOOLS = [
   },
   {
     name: 'create_opportunity',
-    description: 'Create a new deal/opportunity in a pipeline',
+    description: 'Create a new deal/opportunity in a pipeline. Supports custom fields for deal intelligence (ICP Fit, Deal Priority, Pre-Call Brief, etc.).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -169,14 +170,26 @@ const TOOLS = [
         contactId: { type: 'string' },
         name: { type: 'string' },
         monetaryValue: { type: 'number' },
-        status: { type: 'string', enum: ['open', 'won', 'lost', 'abandoned'] }
+        status: { type: 'string', enum: ['open', 'won', 'lost', 'abandoned'] },
+        customFields: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Custom field ID' },
+              key: { type: 'string', description: 'Custom field key (alternative to id)' },
+              field_value: { type: 'string', description: 'Value to set' }
+            }
+          },
+          description: 'Custom field values as [{id, field_value}] or [{key, field_value}]'
+        }
       },
       required: ['pipelineId', 'contactId', 'name']
     }
   },
   {
     name: 'update_opportunity',
-    description: 'Update an opportunity — move stage, change status, update value',
+    description: 'Update an opportunity — move stage, change status, update value, set custom fields (ICP Fit, Deal Priority, Pre-Call Brief, etc.).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -184,7 +197,19 @@ const TOOLS = [
         pipelineStageId: { type: 'string', description: 'New stage ID' },
         status: { type: 'string', enum: ['open', 'won', 'lost', 'abandoned'] },
         monetaryValue: { type: 'number' },
-        name: { type: 'string' }
+        name: { type: 'string' },
+        customFields: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Custom field ID' },
+              key: { type: 'string', description: 'Custom field key (alternative to id)' },
+              field_value: { type: 'string', description: 'Value to set' }
+            }
+          },
+          description: 'Custom field values as [{id, field_value}] or [{key, field_value}]'
+        }
       },
       required: ['opportunityId']
     }
@@ -498,6 +523,24 @@ const TOOLS = [
       required: ['contactId', 'customFields']
     }
   },
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // BUSINESS OBJECTS — Company-level data linked to contacts via businessId
+  // v2.2: Full CRUD with all standard fields + custom fields + tags
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  {
+    name: 'get_businesses',
+    description: 'List all businesses (companies) for this location. Use to check if a business already exists before creating a new one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string', description: 'Search term to filter businesses by name (optional)' },
+        limit: { type: 'number', description: 'Max results (default 25)' },
+        skip: { type: 'number', description: 'Number of results to skip for pagination (default 0)' }
+      }
+    }
+  },
   {
     name: 'get_business',
     description: 'Get a GHL Business object by businessId. Business objects are linked to contacts via businessId and their name field is what appears in the "Company name" column in the GHL contact list view.',
@@ -510,15 +553,84 @@ const TOOLS = [
     }
   },
   {
-    name: 'update_business',
-    description: 'Update a GHL Business object. Use this to update the name that appears in the "Company name" column of the GHL contact list view.',
+    name: 'create_business',
+    description: 'Create a new GHL Business object. After creation, link it to a contact by updating the contact with the returned businessId. Supports all standard fields plus custom fields for AI enrichment data.',
     inputSchema: {
       type: 'object',
       properties: {
-        businessId: { type: 'string', description: 'The businessId from the contact record' },
-        name: { type: 'string', description: 'The business name to set' }
+        name: { type: 'string', description: 'Business/company name (required)' },
+        phone: { type: 'string', description: 'Business phone number' },
+        email: { type: 'string', description: 'Business email address' },
+        website: { type: 'string', description: 'Business website URL' },
+        address: { type: 'string', description: 'Street address' },
+        city: { type: 'string', description: 'City' },
+        state: { type: 'string', description: 'State/province' },
+        postalCode: { type: 'string', description: 'Postal/ZIP code' },
+        country: { type: 'string', description: 'Country' },
+        description: { type: 'string', description: 'Business description' },
+        industry: { type: 'string', description: 'Industry/vertical (e.g. "Construction", "Landscaping")' },
+        employeeCount: { type: 'number', description: 'Number of employees' },
+        annualRevenue: { type: 'number', description: 'Annual revenue in dollars' },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Tags to apply to this business'
+        },
+        customFields: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Custom field ID (from get_location_custom_fields)' },
+              key: { type: 'string', description: 'Custom field key (alternative to id)' },
+              field_value: { type: 'string', description: 'Value to set (use null or "__CLEAR__" to clear)' }
+            }
+          },
+          description: 'Custom field values — Company-model fields for AI enrichment (ICP Score, Revenue Tier, etc.)'
+        }
       },
-      required: ['businessId', 'name']
+      required: ['name']
+    }
+  },
+  {
+    name: 'update_business',
+    description: 'Update a GHL Business object. Supports all standard fields (name, phone, email, website, address, industry, etc.) plus custom fields for AI enrichment data (ICP Score, Company Size Tier, Revenue Tier, Enrichment Status, etc.) and tags. Only sends fields that are provided — omitted fields are not changed.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        businessId: { type: 'string', description: 'The businessId from the contact record (required)' },
+        name: { type: 'string', description: 'Business/company name' },
+        phone: { type: 'string', description: 'Business phone number' },
+        email: { type: 'string', description: 'Business email address' },
+        website: { type: 'string', description: 'Business website URL' },
+        address: { type: 'string', description: 'Street address' },
+        city: { type: 'string', description: 'City' },
+        state: { type: 'string', description: 'State/province' },
+        postalCode: { type: 'string', description: 'Postal/ZIP code' },
+        country: { type: 'string', description: 'Country' },
+        description: { type: 'string', description: 'Business description' },
+        industry: { type: 'string', description: 'Industry/vertical (e.g. "Construction", "Landscaping")' },
+        employeeCount: { type: 'number', description: 'Number of employees' },
+        annualRevenue: { type: 'number', description: 'Annual revenue in dollars' },
+        tags: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Tags to apply to this business'
+        },
+        customFields: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Custom field ID (from get_location_custom_fields)' },
+              key: { type: 'string', description: 'Custom field key (alternative to id)' },
+              field_value: { type: 'string', description: 'Value to set (use null or "__CLEAR__" to clear)' }
+            }
+          },
+          description: 'Custom field values — Company-model fields for AI enrichment (ICP Score, Revenue Tier, etc.)'
+        }
+      },
+      required: ['businessId']
     }
   },
   {
@@ -831,11 +943,49 @@ async function executeTool(name, args) {
       });
     }
 
+    // ── Business Objects ────────────────────────────────────────────────────
+
+    case 'get_businesses': {
+      let url = `/businesses/?locationId=${GHL_LOCATION_ID}&limit=${args.limit || 25}&skip=${args.skip || 0}`;
+      if (args.query) url += `&query=${encodeURIComponent(args.query)}`;
+      return ghlRequest(url);
+    }
+
     case 'get_business':
       return ghlRequest(`/businesses/${args.businessId}`);
 
-    case 'update_business':
-      return ghlRequest(`/businesses/${args.businessId}`, 'PUT', { name: args.name });
+    case 'create_business': {
+      const { customFields: bizCustomFields, ...bizData } = args;
+      const createPayload = { ...bizData, locationId: GHL_LOCATION_ID };
+      // Process custom fields — handle __CLEAR__ → null
+      if (bizCustomFields && bizCustomFields.length > 0) {
+        createPayload.customFields = bizCustomFields.map(f => ({
+          ...f,
+          field_value: (f.field_value === '' || f.field_value === '__CLEAR__') ? null : f.field_value
+        }));
+      }
+      return ghlRequest('/businesses/', 'POST', createPayload);
+    }
+
+    case 'update_business': {
+      const { businessId, customFields: updateCustomFields, ...updateData } = args;
+      const updatePayload = {};
+      // Only include fields that were actually provided (don't send undefined)
+      const standardFields = ['name', 'phone', 'email', 'website', 'address', 'city', 'state', 'postalCode', 'country', 'description', 'industry', 'employeeCount', 'annualRevenue', 'tags'];
+      for (const field of standardFields) {
+        if (updateData[field] !== undefined) {
+          updatePayload[field] = updateData[field];
+        }
+      }
+      // Process custom fields — handle __CLEAR__ → null
+      if (updateCustomFields && updateCustomFields.length > 0) {
+        updatePayload.customFields = updateCustomFields.map(f => ({
+          ...f,
+          field_value: (f.field_value === '' || f.field_value === '__CLEAR__') ? null : f.field_value
+        }));
+      }
+      return ghlRequest(`/businesses/${businessId}`, 'PUT', updatePayload);
+    }
 
     case 'get_forms':
       return ghlRequest(`/forms/?locationId=${GHL_LOCATION_ID}`);
@@ -912,7 +1062,8 @@ module.exports = async (req, res) => {
         p0_messages: 3,
         p1_workflows: 8,
         p2_calendar: 6,
-        p3_advanced: 5
+        p3_advanced: 8,
+        fullenrich: 3
       },
       locationId: GHL_LOCATION_ID ? GHL_LOCATION_ID.substring(0, 8) + '...' : 'NOT SET',
       apiKey: GHL_API_KEY ? 'SET (' + GHL_API_KEY.substring(0, 8) + '...)' : 'NOT SET',
