@@ -3,13 +3,14 @@
 // Expanded: Messages, Workflows, Notes, Tasks, Calendar, Pagination, Custom Fields, Enrichment
 // v2.2: Full business object CRUD (create, read, update, list), opportunity custom fields
 // v2.3: Fixed custom field write formats — Contact/Opportunity use {id, field_value}, Business uses {"key": "value"} object
+// v2.3.1: Fixed appointment create/update — GHL API expects 'appointmentStatus' (not 'status'); added 'new' to enum (GHL's actual default for fresh bookings)
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 const GHL_BASE_URL = process.env.GHL_BASE_URL || 'https://services.leadconnectorhq.com';
 const GHL_VERSION = '2021-07-28';
 const MCP_PROTOCOL_VERSION = '2024-11-05';
-const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.3.0' };
+const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.3.1' };
 
 // ─── Fullenrich API Config ──────────────────────────────────────────────────────
 const FULLENRICH_API_KEY = process.env.FULLENRICH_API_KEY;
@@ -473,7 +474,7 @@ const TOOLS = [
         endTime: { type: 'string', description: 'End time (ISO 8601)' },
         title: { type: 'string' },
         notes: { type: 'string', description: 'Appointment notes (optional)' },
-        status: { type: 'string', enum: ['confirmed', 'cancelled', 'showed', 'noshow', 'invalid'], description: 'Appointment status (default: confirmed)' }
+        status: { type: 'string', enum: ['new', 'confirmed', 'cancelled', 'showed', 'noshow', 'invalid'], description: 'Appointment status (default: new per GHL API)' }
       },
       required: ['calendarId', 'contactId', 'startTime', 'endTime', 'title']
     }
@@ -489,7 +490,7 @@ const TOOLS = [
         endTime: { type: 'string', description: 'New end time (ISO 8601)' },
         title: { type: 'string' },
         notes: { type: 'string' },
-        status: { type: 'string', enum: ['confirmed', 'cancelled', 'showed', 'noshow', 'invalid'] }
+        status: { type: 'string', enum: ['new', 'confirmed', 'cancelled', 'showed', 'noshow', 'invalid'] }
       },
       required: ['appointmentId']
     }
@@ -934,6 +935,7 @@ async function executeTool(name, args) {
       return ghlRequest(`/calendars/events/appointments/${args.appointmentId}`);
 
     case 'create_appointment': {
+      // GHL API v2021-07-28 expects 'appointmentStatus', not 'status'. Default is 'new' for fresh bookings.
       const apptPayload = {
         calendarId: args.calendarId,
         locationId: GHL_LOCATION_ID,
@@ -941,14 +943,16 @@ async function executeTool(name, args) {
         startTime: args.startTime,
         endTime: args.endTime,
         title: args.title,
-        status: args.status || 'confirmed'
+        appointmentStatus: args.status || 'new'
       };
       if (args.notes) apptPayload.notes = args.notes;
       return ghlRequest('/calendars/events/appointments', 'POST', apptPayload);
     }
 
     case 'update_appointment': {
-      const { appointmentId, ...apptData } = args;
+      // GHL API expects 'appointmentStatus', not 'status' — rename before PUT.
+      const { appointmentId, status, ...apptData } = args;
+      if (status !== undefined) apptData.appointmentStatus = status;
       return ghlRequest(`/calendars/events/appointments/${appointmentId}`, 'PUT', apptData);
     }
 
