@@ -4,13 +4,14 @@
 // v2.2: Full business object CRUD (create, read, update, list), opportunity custom fields
 // v2.3: Fixed custom field write formats — Contact/Opportunity use {id, field_value}, Business uses {"key": "value"} object
 // v2.3.1: Fixed appointment create/update — GHL API expects 'appointmentStatus' (not 'status'); added 'new' to enum (GHL's actual default for fresh bookings)
+// v2.3.2 (security): Path-based secret auth (MCP_PATH_SECRET env var required). Slimmed health endpoint (no credential prefixes leaked). Removed wildcard CORS. All endpoints now require /<secret>/ URL prefix; bare /sse and /health no longer respond.
 
 const GHL_API_KEY = process.env.GHL_API_KEY;
 const GHL_LOCATION_ID = process.env.GHL_LOCATION_ID;
 const GHL_BASE_URL = process.env.GHL_BASE_URL || 'https://services.leadconnectorhq.com';
 const GHL_VERSION = '2021-07-28';
 const MCP_PROTOCOL_VERSION = '2024-11-05';
-const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.3.1' };
+const SERVER_INFO = { name: 'ghl-mcp-server', version: '2.3.2' };
 
 // ─── Fullenrich API Config ──────────────────────────────────────────────────────
 const FULLENRICH_API_KEY = process.env.FULLENRICH_API_KEY;
@@ -1077,49 +1078,52 @@ const rpcError = (id, code, message) => ({ jsonrpc: '2.0', id, error: { code, me
 const rpcNotification = (method, params = {}) => ({ jsonrpc: '2.0', method, params });
 const sendSSE = (res, data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
-function setCORS(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, Authorization, Mcp-Session-Id');
-}
-
 // ─── Main Handler ─────────────────────────────────────────────────────────────
+// SECURITY: All endpoints require URL prefix /<MCP_PATH_SECRET>/...
+// Without the secret in the path, every request returns 404. The secret is
+// configured as a Vercel env var and must be high-entropy (32+ random chars).
 
 module.exports = async (req, res) => {
-  setCORS(res);
+  // Refuse to serve anything if MCP_PATH_SECRET isn't configured.
+  // This prevents accidental unauth deployments.
+  const SECRET = process.env.MCP_PATH_SECRET;
+  if (!SECRET || SECRET.length < 16) {
+    res.status(500).json({ error: 'Server configuration error' });
+    return;
+  }
 
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
 
-  const url = req.url?.split('?')[0];
+  const path = (req.url || '').split('?')[0];
+  const expectedPrefix = `/${SECRET}`;
 
-  if (url === '/health' || url === '/') {
+  // Reject anything that doesn't begin with the secret prefix.
+  // Use 404 (not 401) so scanners can't tell the secret-protected URL space exists.
+  if (path !== expectedPrefix && !path.startsWith(`${expectedPrefix}/`)) {
+    res.status(404).json({ error: 'Not found' });
+    return;
+  }
+
+  // Strip the secret prefix to get the actual route.
+  const route = path === expectedPrefix ? '/' : path.slice(expectedPrefix.length);
+
+  // Health endpoint — slimmed to remove credential prefixes and endpoint hints.
+  if (route === '/' || route === '/health') {
     res.status(200).json({
-      status: 'healthy', server: SERVER_INFO.name, version: SERVER_INFO.version,
-      protocol: MCP_PROTOCOL_VERSION, timestamp: new Date().toISOString(),
-      toolCount: TOOLS.length,
-      toolNames: TOOLS.map(t => t.name),
-      toolGroups: {
-        original: 16,
-        p0_messages: 3,
-        p1_workflows: 8,
-        p2_calendar: 6,
-        p3_advanced: 8,
-        fullenrich: 3
-      },
-      locationId: GHL_LOCATION_ID ? GHL_LOCATION_ID.substring(0, 8) + '...' : 'NOT SET',
-      apiKey: GHL_API_KEY ? 'SET (' + GHL_API_KEY.substring(0, 8) + '...)' : 'NOT SET',
-      endpoint: '/sse'
+      status: 'healthy',
+      server: SERVER_INFO.name,
+      version: SERVER_INFO.version,
+      timestamp: new Date().toISOString(),
+      toolCount: TOOLS.length
     });
     return;
   }
 
-  if (url?.includes('favicon')) { res.status(404).end(); return; }
-
-  if (url === '/sse') {
+  if (route === '/sse') {
     res.writeHead(200, {
-      'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
-      'Connection': 'keep-alive', 'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, Accept, Authorization, Mcp-Session-Id'
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive'
     });
 
     if (req.method === 'GET') {
