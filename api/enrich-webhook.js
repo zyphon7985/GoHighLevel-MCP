@@ -377,33 +377,33 @@ const handler = async (req, res) => {
 
   console.log(`[enrich-webhook] Webhook received for contact ${contactId}`);
 
-  // 7. Run enrichment SYNCHRONOUSLY (Vercel serverless tends to kill post-response
-  // background work, so we work first and respond after). GHL's webhook timeout
-  // is generous enough for a typical 30-50s enrichment.
-  let result;
-  try {
-    result = await runEnrichment(contactId);
-    console.log(`[enrich-webhook] Result: ${JSON.stringify(result).substring(0, 800)}`);
-  } catch (err) {
-    console.error(`[enrich-webhook] Enrichment failed: ${err.message}`);
-    if (err.stack) console.error(err.stack);
-    res.status(500).json({ ok: false, error: err.message, contactId });
-    return;
-  }
-
-  // 8. Respond to GHL with the outcome
+  // 7. Ack GHL IMMEDIATELY so its 60s webhook timeout is satisfied. The full
+  // enrichment runs after this response (continues in the same Vercel function
+  // instance — Fluid Compute keeps it alive until maxDuration or natural exit).
+  // The actual writeback to GHL (custom fields + brief note) happens via direct
+  // GHL API calls inside the agent loop, so GHL gets all enrichment data via
+  // that channel — not via this webhook response.
   res.status(200).json({
     ok: true,
     contactId,
-    enrichment: {
-      ok: result.ok,
-      turns: result.turns,
-      elapsedSeconds: result.elapsedSeconds
-    },
-    finished_at: new Date().toISOString()
+    status: 'enrichment_started',
+    received_at: new Date().toISOString()
   });
+
+  // 8. Run enrichment AFTER ack. Awaited so the function instance stays alive
+  // until completion. Errors are logged only — we cannot send a 2nd HTTP
+  // response (headers already sent above).
+  try {
+    const result = await runEnrichment(contactId);
+    console.log(`[enrich-webhook] Background enrichment complete: ${JSON.stringify(result).substring(0, 800)}`);
+  } catch (err) {
+    console.error(`[enrich-webhook] Background enrichment failed: ${err.message}`);
+    if (err.stack) console.error(err.stack);
+  }
 };
 
 module.exports = handler;
-// Tell Vercel this function may run up to 60s (matches Hobby-tier max).
+// Tell Vercel this function may run up to 5 min (Fluid Compute Hobby max).
+// The function acks GHL within ~1s and continues running the enrichment in
+// the background — the maxDuration bounds the total work.
 module.exports.config = { maxDuration: 300 };
