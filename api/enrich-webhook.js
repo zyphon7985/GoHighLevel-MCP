@@ -202,12 +202,13 @@ async function callAnthropic(messages) {
 
   console.log(`[anthropic] POST ${ANTHROPIC_API_URL} body=${JSON.stringify(body).length}b`);
 
-  // Hard 50s timeout so we never silently hang past Vercel's max function duration.
+  // Hard 240s per-turn timeout. Vercel Fluid Compute Hobby max is 300s (5 min).
+  // Leave 60s headroom for response handling + remaining loop iterations.
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
-    console.warn('[anthropic] aborting fetch after 50s');
+    console.warn('[anthropic] aborting fetch after 240s');
     controller.abort();
-  }, 50000);
+  }, 240000);
 
   let res;
   try {
@@ -260,10 +261,19 @@ async function runEnrichment(contactId) {
     }
   ];
 
+  // Don't start a new Anthropic call if we have less than 30s of function budget left.
+  // Vercel max is 300s; leave 30s for the call to actually finish + bookkeeping.
+  const FUNCTION_BUDGET_MS = 270000;
+
   let turn = 0;
   while (turn < MAX_TURNS) {
     turn++;
-    console.log(`[enrich] turn=${turn} calling Anthropic`);
+    const elapsedMs = Date.now() - startTime;
+    if (elapsedMs > FUNCTION_BUDGET_MS) {
+      console.warn(`[enrich] turn=${turn} aborting before call: elapsed=${(elapsedMs/1000).toFixed(1)}s exceeds budget`);
+      return { ok: false, turns: turn - 1, error: 'function_budget_exhausted', elapsedSeconds: (elapsedMs/1000).toFixed(1) };
+    }
+    console.log(`[enrich] turn=${turn} calling Anthropic (elapsed=${(elapsedMs/1000).toFixed(1)}s)`);
 
     const response = await callAnthropic(messages);
     const usage = response.usage || {};
@@ -404,4 +414,4 @@ const handler = async (req, res) => {
 
 module.exports = handler;
 // Tell Vercel this function may run up to 60s (matches Hobby-tier max).
-module.exports.config = { maxDuration: 60 };
+module.exports.config = { maxDuration: 300 };
