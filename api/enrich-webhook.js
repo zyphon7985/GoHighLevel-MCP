@@ -338,22 +338,31 @@ const handler = async (req, res) => {
 
   console.log(`[enrich-webhook] Webhook received for contact ${contactId}`);
 
-  // 7. Acknowledge to GHL FAST so it doesn't retry/timeout
-  res.status(200).json({
-    ok: true,
-    contactId,
-    status: 'enrichment_started',
-    received_at: new Date().toISOString()
-  });
-
-  // 8. Run enrichment in background (Vercel keeps function alive until handler returns or maxDuration)
+  // 7. Run enrichment SYNCHRONOUSLY (Vercel serverless tends to kill post-response
+  // background work, so we work first and respond after). GHL's webhook timeout
+  // is generous enough for a typical 30-50s enrichment.
+  let result;
   try {
-    const result = await runEnrichment(contactId);
+    result = await runEnrichment(contactId);
     console.log(`[enrich-webhook] Result: ${JSON.stringify(result).substring(0, 800)}`);
   } catch (err) {
     console.error(`[enrich-webhook] Enrichment failed: ${err.message}`);
     if (err.stack) console.error(err.stack);
+    res.status(500).json({ ok: false, error: err.message, contactId });
+    return;
   }
+
+  // 8. Respond to GHL with the outcome
+  res.status(200).json({
+    ok: true,
+    contactId,
+    enrichment: {
+      ok: result.ok,
+      turns: result.turns,
+      elapsedSeconds: result.elapsedSeconds
+    },
+    finished_at: new Date().toISOString()
+  });
 };
 
 module.exports = handler;
