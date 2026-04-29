@@ -7,6 +7,7 @@
     }
   ],
   "routes": [
+    { "src": "/enrich-webhook", "dest": "/api/enrich-webhook.js" },
     { "src": "/(.*)", "dest": "/api/index.js" }
   ]
-} 
+}
