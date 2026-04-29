@@ -200,20 +200,51 @@ async function callAnthropic(messages) {
     ]
   };
 
-  const res = await fetch(ANTHROPIC_API_URL, {
-    method: 'POST',
-    headers: {
-      'x-api-key': process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': ANTHROPIC_BETA,
-      'content-type': 'application/json'
-    },
-    body: JSON.stringify(body)
-  });
+  console.log(`[anthropic] POST ${ANTHROPIC_API_URL} body=${JSON.stringify(body).length}b`);
+
+  // Hard 50s timeout so we never silently hang past Vercel's max function duration.
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => {
+    console.warn('[anthropic] aborting fetch after 50s');
+    controller.abort();
+  }, 50000);
+
+  let res;
+  try {
+    res = await fetch(ANTHROPIC_API_URL, {
+      method: 'POST',
+      headers: {
+        'x-api-key': process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+        'anthropic-beta': ANTHROPIC_BETA,
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+  } catch (err) {
+    clearTimeout(timeoutId);
+    console.error(`[anthropic] fetch threw: ${err.name}: ${err.message}`);
+    throw err;
+  }
+  clearTimeout(timeoutId);
+
+  console.log(`[anthropic] response status=${res.status}`);
 
   const text = await res.text();
-  if (!res.ok) throw new Error(`Anthropic API ${res.status}: ${text.substring(0, 1000)}`);
-  return JSON.parse(text);
+  console.log(`[anthropic] response body=${text.length}b status=${res.status}`);
+
+  if (!res.ok) {
+    console.error(`[anthropic] error body: ${text.substring(0, 2000)}`);
+    throw new Error(`Anthropic API ${res.status}: ${text.substring(0, 1000)}`);
+  }
+
+  try {
+    return JSON.parse(text);
+  } catch (err) {
+    console.error(`[anthropic] JSON parse failed: ${err.message}; body preview: ${text.substring(0, 500)}`);
+    throw err;
+  }
 }
 
 // ─── Agent loop ────────────────────────────────────────────────────────────
