@@ -188,7 +188,13 @@ async function callAnthropic(messages) {
       { type: 'text', text: SYSTEM_PROMPT, cache_control: { type: 'ephemeral' } }
     ],
     messages,
-    tools: CUSTOM_TOOLS,
+    // The mcp-client-2025-11-20 beta requires an explicit mcp_toolset entry in
+    // tools to bind the model to a declared MCP server. Without it, the API
+    // returns "MCP server 'ghl' is defined but [not used]".
+    tools: [
+      ...CUSTOM_TOOLS,
+      { type: 'mcp_toolset', mcp_server_name: 'ghl' }
+    ],
     mcp_servers: [
       { type: 'url', url: mcpUrl, name: 'ghl' }
     ]
