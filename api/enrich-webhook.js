@@ -15,15 +15,17 @@ const ANTHROPIC_BETA = 'mcp-client-2025-11-20';
 const MODEL = 'claude-sonnet-4-6';  // Switch to 'claude-opus-4-7' for max quality at ~5x cost
 const MAX_TOKENS_PER_TURN = 4096;
 const MAX_TURNS = 30;  // Safety cap on agent loop iterations
-// Per-turn fetch timeout for the Anthropic API. Tuned to fit multiple turns
-// inside Vercel's 300s function ceiling. A normal turn returns in 5-30s; 90s
-// is generous margin without burning the whole budget on one stuck call.
-const PER_TURN_TIMEOUT_MS = 90 * 1000;
+// Per-turn fetch timeout for the Anthropic API (first attempt). Tuned for
+// the 800s Vercel Pro function ceiling. A normal turn returns in 5-30s;
+// 180s gives heavy turns (large accumulated context + content-rich tool
+// results) plenty of room to complete without retrying.
+const PER_TURN_TIMEOUT_MS = 180 * 1000;
 // Total enrichment budget. We proactively bail before this elapsed time so
 // postFailureNotification has a chance to fire cleanly. Vercel hard-kills
-// the function at maxDuration (300s) without unwinding the promise chain,
-// which would otherwise drop the .catch handler and skip the Slack alert.
-const ENRICHMENT_DEADLINE_MS = 270 * 1000;
+// the function at maxDuration (800s on Pro) without unwinding the promise
+// chain, which would otherwise drop the .catch handler and skip the Slack
+// alert. 50s of cleanup headroom keeps the alert path reliable.
+const ENRICHMENT_DEADLINE_MS = 750 * 1000;
 
 // The lead-enrichment skill content, JSON-escaped at build time so it can be
 // embedded as a JS string literal. The agent's system prompt wraps this with
@@ -148,17 +150,6 @@ async function execApolloOrgEnrich(input) {
   return JSON.parse(text);
 }
 
-// Cap on markdown returned to the agent. Enterprise B2B sites
-// (Keyence, Caterpillar, etc.) can return 80+ KB of markdown, which
-// inflates the next turn's request body to a size Anthropic cannot
-// process within our 90s per-turn timeout. The hero/services/about
-// content is almost always in the first 20-25 KB; everything below
-// that is usually footer, related links, and product catalogs that
-// don't materially affect ICP scoring or pre-call brief generation.
-// If the agent needs more depth, it can scrape a more specific URL
-// (we tell it so via the truncation marker).
-const FIRECRAWL_MARKDOWN_MAX_CHARS = 25000;
-
 async function execFirecrawlScrape(input) {
   const body = {
     url: input.url,
@@ -175,19 +166,11 @@ async function execFirecrawlScrape(input) {
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`Firecrawl scrape ${res.status}: ${text.substring(0, 500)}`);
-  const result = JSON.parse(text);
-
-  // Truncate oversized markdown before handing it back to the agent.
-  const md = result && result.data && result.data.markdown;
-  if (typeof md === 'string' && md.length > FIRECRAWL_MARKDOWN_MAX_CHARS) {
-    const original = md.length;
-    result.data.markdown =
-      md.substring(0, FIRECRAWL_MARKDOWN_MAX_CHARS) +
-      `\n\n[CONTENT TRUNCATED — original markdown was ${original} characters; truncated to ${FIRECRAWL_MARKDOWN_MAX_CHARS} to fit Anthropic processing budget. If you need more detail, call firecrawl_scrape on a more specific URL such as /about, /services, /products, or /our-work — those subpages are usually well under the limit and contain the targeted content you need for ICP scoring.]`;
-    console.log(`[firecrawl_scrape] truncated markdown ${original} -> ${FIRECRAWL_MARKDOWN_MAX_CHARS} for url=${input.url}`);
-  }
-
-  return result;
+  // No size truncation — Vercel Pro's 800s function ceiling combined with
+  // adaptive 180s/300s per-turn timeouts gives Anthropic enough room to
+  // process full enterprise-site markdown. The agent gets every signal the
+  // page surfaces and can extract anywhere on it.
+  return JSON.parse(text);
 }
 
 async function execFirecrawlSearch(input) {
@@ -308,13 +291,13 @@ async function callAnthropic(messages, timeoutMs = PER_TURN_TIMEOUT_MS) {
 
 async function callAnthropicWithRetry(messages, maxAttempts = 2) {
   // Adaptive per-attempt timeout. Heavy turns (large accumulated context plus
-  // big tool results) genuinely need more than 90s to process. The first
-  // attempt uses the standard 90s; if that fails, the retry gets 150s. Worst
-  // case = 90s + 1s backoff + 150s = 241s, leaves headroom under the 270s
-  // deadline guard. The same body retried with the same 90s would just hit
-  // the same wall — that pattern was responsible for both real-lead failures
-  // we observed today.
-  const timeoutSchedule = [PER_TURN_TIMEOUT_MS, 150 * 1000];
+  // content-rich tool results) genuinely need extra time to process. The
+  // first attempt uses 180s; if that fails, the retry gets 300s. Worst case
+  // per stuck turn = 180s + 1s backoff + 300s = 481s, well under the 750s
+  // deadline guard on Vercel Pro (800s function ceiling). The same body
+  // retried with the same first-attempt window would just hit the same
+  // wall — that pattern caused early real-lead failures.
+  const timeoutSchedule = [PER_TURN_TIMEOUT_MS, 300 * 1000];
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const attemptTimeout = timeoutSchedule[attempt - 1] || timeoutSchedule[timeoutSchedule.length - 1];
@@ -601,7 +584,9 @@ const handler = async (req, res) => {
 };
 
 module.exports = handler;
-// Tell Vercel this function may run up to 5 min (Fluid Compute Hobby max).
-// The function acks GHL within ~1s and continues running the enrichment in
-// the background — the maxDuration bounds the total work.
-module.exports.config = { maxDuration: 300 };
+// Tell Vercel this function may run up to ~13 min (Vercel Pro Fluid Compute
+// max is 800s). The function acks GHL within ~1s and continues running the
+// enrichment in the background — the maxDuration bounds the total work.
+// ENRICHMENT_DEADLINE_MS at the top of the file is set 50s below this so
+// the deadline guard fires Slack alerts cleanly before Vercel hard-kills.
+module.exports.config = { maxDuration: 800 };
