@@ -136,6 +136,17 @@ async function execApolloOrgEnrich(input) {
   return JSON.parse(text);
 }
 
+// Cap on markdown returned to the agent. Enterprise B2B sites
+// (Keyence, Caterpillar, etc.) can return 80+ KB of markdown, which
+// inflates the next turn's request body to a size Anthropic cannot
+// process within our 90s per-turn timeout. The hero/services/about
+// content is almost always in the first 20-25 KB; everything below
+// that is usually footer, related links, and product catalogs that
+// don't materially affect ICP scoring or pre-call brief generation.
+// If the agent needs more depth, it can scrape a more specific URL
+// (we tell it so via the truncation marker).
+const FIRECRAWL_MARKDOWN_MAX_CHARS = 25000;
+
 async function execFirecrawlScrape(input) {
   const body = {
     url: input.url,
@@ -152,7 +163,19 @@ async function execFirecrawlScrape(input) {
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`Firecrawl scrape ${res.status}: ${text.substring(0, 500)}`);
-  return JSON.parse(text);
+  const result = JSON.parse(text);
+
+  // Truncate oversized markdown before handing it back to the agent.
+  const md = result && result.data && result.data.markdown;
+  if (typeof md === 'string' && md.length > FIRECRAWL_MARKDOWN_MAX_CHARS) {
+    const original = md.length;
+    result.data.markdown =
+      md.substring(0, FIRECRAWL_MARKDOWN_MAX_CHARS) +
+      `\n\n[CONTENT TRUNCATED — original markdown was ${original} characters; truncated to ${FIRECRAWL_MARKDOWN_MAX_CHARS} to fit Anthropic processing budget. If you need more detail, call firecrawl_scrape on a more specific URL such as /about, /services, /products, or /our-work — those subpages are usually well under the limit and contain the targeted content you need for ICP scoring.]`;
+    console.log(`[firecrawl_scrape] truncated markdown ${original} -> ${FIRECRAWL_MARKDOWN_MAX_CHARS} for url=${input.url}`);
+  }
+
+  return result;
 }
 
 async function execFirecrawlSearch(input) {
