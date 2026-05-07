@@ -34,6 +34,8 @@ Fullenrich rule from the skill (Default: OFF) applies here too — do not call F
 
 Operate autonomously. Perform all writes (update_contact, update_business, create_contact_note). Do not ask for confirmation. When finished, return a brief one-paragraph summary of what was enriched and the ICP score assigned.
 
+IDEMPOTENCY GUARD: Your first action must be get_contact for the contact ID provided. Read the Enrichment Date and Enrichment Status custom fields from the response. If Enrichment Date is within the last 1 hour AND Enrichment Status is "Fully Enriched", stop immediately and return the exact text: "Skipped — contact was already enriched within the last hour." Do not call any other tools, do not perform any writes, do not re-run the pipeline. This guards against duplicate webhook fires and concurrent runs. The 30-day freshness gate in the skill applies to manual user-driven enrichment; this 1-hour guard is the autonomous-webhook equivalent.
+
 ---
 
 ${SKILL_CONTENT}`;
@@ -251,6 +253,62 @@ async function callAnthropic(messages) {
   }
 }
 
+// ─── Anthropic retry wrapper ───────────────────────────────────────────────
+// Wraps callAnthropic with a small retry-on-transient-error budget. Retries
+// on 429, common 5xx, Anthropic 529 (overloaded), MCP-server connection
+// errors (which surface as 400s with a specific message), AbortError, and
+// network-level failures. Backoff is short (1s, 3s) so a degenerate case
+// adds at most ~4s per turn. Hard failures (400 bad request, 401 auth, etc.)
+// still throw immediately — they will not be cured by retry.
+
+async function callAnthropicWithRetry(messages, maxAttempts = 3) {
+  let lastErr;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await callAnthropic(messages);
+    } catch (err) {
+      lastErr = err;
+      const msg = (err && err.message) || '';
+      const isTransient =
+        /\b(429|500|502|503|504|529)\b/.test(msg) ||
+        /MCP server|Connection error/i.test(msg) ||
+        /ECONNRESET|ETIMEDOUT|fetch failed|socket hang up|aborted/i.test(msg) ||
+        err.name === 'AbortError';
+      if (!isTransient || attempt === maxAttempts) {
+        if (attempt > 1) {
+          console.error(`[anthropic] giving up after ${attempt} attempts: ${msg.substring(0, 200)}`);
+        }
+        throw err;
+      }
+      const backoffMs = attempt === 1 ? 1000 : 3000;
+      console.warn(`[anthropic] transient failure attempt=${attempt}/${maxAttempts} reason="${msg.substring(0, 200)}" retrying in ${backoffMs}ms`);
+      await new Promise((r) => setTimeout(r, backoffMs));
+    }
+  }
+  throw lastErr;
+}
+
+// ─── Failure notification helper ───────────────────────────────────────────
+// Optional — only fires if NOTIFY_WEBHOOK_URL is set. Wire this to a GHL
+// workflow webhook, n8n flow, Zapier hook, or any HTTPS endpoint that knows
+// how to deliver a notification. Best-effort: notification failures are
+// swallowed so they never mask the underlying enrichment failure.
+
+async function postFailureNotification(payload) {
+  const url = process.env.NOTIFY_WEBHOOK_URL;
+  if (!url) return;
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    console.log(`[enrich-webhook] notification posted status=${res.status}`);
+  } catch (err) {
+    console.error(`[enrich-webhook] notification webhook errored: ${err.message}`);
+  }
+}
+
 // ─── Agent loop ────────────────────────────────────────────────────────────
 
 async function runEnrichment(contactId) {
@@ -269,7 +327,7 @@ async function runEnrichment(contactId) {
     turn++;
     console.log(`[enrich] turn=${turn} calling Anthropic`);
 
-    const response = await callAnthropic(messages);
+    const response = await callAnthropicWithRetry(messages);
     const usage = response.usage || {};
     console.log(`[enrich] turn=${turn} stop=${response.stop_reason} ` +
                 `in=${usage.input_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} ` +
@@ -398,14 +456,40 @@ const handler = async (req, res) => {
   // response is flushed. waitUntil() is the documented mechanism for extending
   // function lifetime past the response, bounded by maxDuration. Errors are
   // logged only — we cannot send a 2nd HTTP response (headers already sent).
+  // Failures (both thrown and returned-with-ok=false) trigger an optional
+  // notification webhook plus a [ENRICHMENT_FAILURE] log line for grep.
   waitUntil(
     runEnrichment(contactId)
-      .then((result) => {
-        console.log(`[enrich-webhook] Background enrichment complete: ${JSON.stringify(result).substring(0, 800)}`);
+      .then(async (result) => {
+        if (result && result.ok) {
+          console.log(`[enrich-webhook] Background enrichment complete: ${JSON.stringify(result).substring(0, 800)}`);
+          return;
+        }
+        const reason = (result && result.error) || 'unknown';
+        const turns = result && result.turns;
+        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} reason=${reason} turns=${turns}`);
+        await postFailureNotification({
+          event: 'lead_enrichment_failed',
+          source: 'returned_failure',
+          contact_id: contactId,
+          reason,
+          turns,
+          timestamp: new Date().toISOString(),
+          deployment_url: process.env.VERCEL_URL || 'unknown'
+        });
       })
-      .catch((err) => {
-        console.error(`[enrich-webhook] Background enrichment failed: ${err.message}`);
-        if (err.stack) console.error(err.stack);
+      .catch(async (err) => {
+        const msg = (err && err.message) || 'unknown error';
+        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} threw: ${msg}`);
+        if (err && err.stack) console.error(err.stack);
+        await postFailureNotification({
+          event: 'lead_enrichment_failed',
+          source: 'thrown_error',
+          contact_id: contactId,
+          reason: msg.substring(0, 500),
+          timestamp: new Date().toISOString(),
+          deployment_url: process.env.VERCEL_URL || 'unknown'
+        });
       })
   );
 };

@@ -52,3 +52,4 @@ pids/
 tmp/
 temp/ 
 .vercel
+.env*.local
