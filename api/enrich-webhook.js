@@ -226,7 +226,7 @@ async function executeCustomTool(name, input) {
 
 // ─── Anthropic API call ────────────────────────────────────────────────────
 
-async function callAnthropic(messages) {
+async function callAnthropic(messages, timeoutMs = PER_TURN_TIMEOUT_MS) {
   const mcpUrl = `https://go-high-level-mcp-theta.vercel.app/${process.env.MCP_PATH_SECRET}/sse`;
 
   const body = {
@@ -248,16 +248,17 @@ async function callAnthropic(messages) {
     ]
   };
 
-  console.log(`[anthropic] POST ${ANTHROPIC_API_URL} body=${JSON.stringify(body).length}b`);
+  console.log(`[anthropic] POST ${ANTHROPIC_API_URL} body=${JSON.stringify(body).length}b timeout=${timeoutMs / 1000}s`);
 
-  // Per-turn fetch timeout. See PER_TURN_TIMEOUT_MS at top of file for tuning
-  // rationale. If Anthropic doesn't respond within this window, abort and let
-  // the retry wrapper try once more on a (likely-warm) cache.
+  // Per-turn fetch timeout. The wrapper passes a longer value on retries, since
+  // the retry-after-timeout case usually means Anthropic legitimately needs
+  // more time to process the body (which is identical between attempts), and
+  // the same 90s window will fail the same way.
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
-    console.warn(`[anthropic] aborting fetch after ${PER_TURN_TIMEOUT_MS / 1000}s`);
+    console.warn(`[anthropic] aborting fetch after ${timeoutMs / 1000}s`);
     controller.abort();
-  }, PER_TURN_TIMEOUT_MS);
+  }, timeoutMs);
 
   let res;
   try {
@@ -306,10 +307,19 @@ async function callAnthropic(messages) {
 // still throw immediately — they will not be cured by retry.
 
 async function callAnthropicWithRetry(messages, maxAttempts = 2) {
+  // Adaptive per-attempt timeout. Heavy turns (large accumulated context plus
+  // big tool results) genuinely need more than 90s to process. The first
+  // attempt uses the standard 90s; if that fails, the retry gets 150s. Worst
+  // case = 90s + 1s backoff + 150s = 241s, leaves headroom under the 270s
+  // deadline guard. The same body retried with the same 90s would just hit
+  // the same wall — that pattern was responsible for both real-lead failures
+  // we observed today.
+  const timeoutSchedule = [PER_TURN_TIMEOUT_MS, 150 * 1000];
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const attemptTimeout = timeoutSchedule[attempt - 1] || timeoutSchedule[timeoutSchedule.length - 1];
     try {
-      return await callAnthropic(messages);
+      return await callAnthropic(messages, attemptTimeout);
     } catch (err) {
       lastErr = err;
       const msg = (err && err.message) || '';
@@ -325,7 +335,7 @@ async function callAnthropicWithRetry(messages, maxAttempts = 2) {
         throw err;
       }
       const backoffMs = attempt === 1 ? 1000 : 3000;
-      console.warn(`[anthropic] transient failure attempt=${attempt}/${maxAttempts} reason="${msg.substring(0, 200)}" retrying in ${backoffMs}ms`);
+      console.warn(`[anthropic] transient failure attempt=${attempt}/${maxAttempts} reason="${msg.substring(0, 200)}" retrying in ${backoffMs}ms (next timeout=${(timeoutSchedule[attempt] || timeoutSchedule[timeoutSchedule.length - 1]) / 1000}s)`);
       await new Promise((r) => setTimeout(r, backoffMs));
     }
   }
