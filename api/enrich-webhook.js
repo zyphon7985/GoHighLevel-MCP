@@ -15,6 +15,15 @@ const ANTHROPIC_BETA = 'mcp-client-2025-11-20';
 const MODEL = 'claude-sonnet-4-6';  // Switch to 'claude-opus-4-7' for max quality at ~5x cost
 const MAX_TOKENS_PER_TURN = 4096;
 const MAX_TURNS = 30;  // Safety cap on agent loop iterations
+// Per-turn fetch timeout for the Anthropic API. Tuned to fit multiple turns
+// inside Vercel's 300s function ceiling. A normal turn returns in 5-30s; 90s
+// is generous margin without burning the whole budget on one stuck call.
+const PER_TURN_TIMEOUT_MS = 90 * 1000;
+// Total enrichment budget. We proactively bail before this elapsed time so
+// postFailureNotification has a chance to fire cleanly. Vercel hard-kills
+// the function at maxDuration (300s) without unwinding the promise chain,
+// which would otherwise drop the .catch handler and skip the Slack alert.
+const ENRICHMENT_DEADLINE_MS = 270 * 1000;
 
 // The lead-enrichment skill content, JSON-escaped at build time so it can be
 // embedded as a JS string literal. The agent's system prompt wraps this with
@@ -206,14 +215,14 @@ async function callAnthropic(messages) {
 
   console.log(`[anthropic] POST ${ANTHROPIC_API_URL} body=${JSON.stringify(body).length}b`);
 
-  // Per-turn fetch timeout. Vercel Fluid Compute Hobby max is 300s.
-  // Set high enough that the agent has room to breathe; we'd rather see real
-  // results than abort prematurely.
+  // Per-turn fetch timeout. See PER_TURN_TIMEOUT_MS at top of file for tuning
+  // rationale. If Anthropic doesn't respond within this window, abort and let
+  // the retry wrapper try once more on a (likely-warm) cache.
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
-    console.warn('[anthropic] aborting fetch after 280s');
+    console.warn(`[anthropic] aborting fetch after ${PER_TURN_TIMEOUT_MS / 1000}s`);
     controller.abort();
-  }, 280000);
+  }, PER_TURN_TIMEOUT_MS);
 
   let res;
   try {
@@ -261,7 +270,7 @@ async function callAnthropic(messages) {
 // adds at most ~4s per turn. Hard failures (400 bad request, 401 auth, etc.)
 // still throw immediately — they will not be cured by retry.
 
-async function callAnthropicWithRetry(messages, maxAttempts = 3) {
+async function callAnthropicWithRetry(messages, maxAttempts = 2) {
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -365,8 +374,22 @@ async function runEnrichment(contactId) {
 
   let turn = 0;
   while (turn < MAX_TURNS) {
+    // Deadline guard: bail before Vercel hard-kills the function so the
+    // failure notification fires cleanly. Without this check, a function
+    // that runs past maxDuration (300s) is killed with no chance to run
+    // the .catch handler in waitUntil, and no Slack alert is sent.
+    const elapsed = Date.now() - startTime;
+    if (elapsed > ENRICHMENT_DEADLINE_MS) {
+      console.warn(`[enrich] deadline exceeded at ${(elapsed / 1000).toFixed(1)}s — bailing`);
+      return {
+        ok: false,
+        turns: turn,
+        elapsedSeconds: (elapsed / 1000).toFixed(1),
+        error: `deadline_exceeded after ${turn} turns and ${(elapsed / 1000).toFixed(1)}s (Vercel maxDuration is 300s; budget is ${ENRICHMENT_DEADLINE_MS / 1000}s)`
+      };
+    }
     turn++;
-    console.log(`[enrich] turn=${turn} calling Anthropic`);
+    console.log(`[enrich] turn=${turn} calling Anthropic (elapsed=${(elapsed / 1000).toFixed(1)}s)`);
 
     const response = await callAnthropicWithRetry(messages);
     const usage = response.usage || {};
