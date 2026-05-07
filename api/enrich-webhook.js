@@ -289,14 +289,55 @@ async function callAnthropicWithRetry(messages, maxAttempts = 3) {
 }
 
 // ─── Failure notification helper ───────────────────────────────────────────
-// Optional — only fires if NOTIFY_WEBHOOK_URL is set. Wire this to a GHL
-// workflow webhook, n8n flow, Zapier hook, or any HTTPS endpoint that knows
-// how to deliver a notification. Best-effort: notification failures are
-// swallowed so they never mask the underlying enrichment failure.
+// Optional — only fires if NOTIFY_WEBHOOK_URL is set. Built to be universal:
+// the payload includes a `text` field (Slack mrkdwn-formatted, the only field
+// Slack Incoming Webhooks actually need) plus structured fields for any
+// other consumer (n8n, Zapier, GHL workflow webhook, ntfy.sh, etc.) — those
+// just read the structured keys and ignore `text`. Slack reads `text` and
+// ignores the structured keys. Universal payload.
+//
+// Best-effort: notification failures are swallowed so they never mask the
+// underlying enrichment failure.
 
-async function postFailureNotification(payload) {
+function buildNotificationPayload({ source, contactId, reason, turns, timestamp }) {
+  const ghlLoc = process.env.GHL_LOCATION_ID;
+  const contactUrl = ghlLoc
+    ? `https://app.gohighlevel.com/v2/location/${ghlLoc}/contacts/detail/${contactId}`
+    : null;
+  const logsUrl = 'https://vercel.com/robvaniglia-gmailcoms-projects/go-high-level-mcp/logs';
+
+  // Slack mrkdwn (single asterisks for bold, <URL|text> for links).
+  const lines = [
+    '*Lead enrichment failed*',
+    `*Contact:* \`${contactId}\``,
+    `*Reason:* ${reason}`,
+    `*Source:* ${source}`
+  ];
+  if (turns != null) lines.push(`*Turns completed:* ${turns}`);
+  lines.push(`*Time:* ${timestamp}`);
+  const linkParts = [];
+  if (contactUrl) linkParts.push(`<${contactUrl}|View contact in GHL>`);
+  linkParts.push(`<${logsUrl}|Open Vercel logs>`);
+  lines.push(linkParts.join(' | '));
+
+  return {
+    text: lines.join('\n'),
+    event: 'lead_enrichment_failed',
+    source,
+    contact_id: contactId,
+    reason,
+    turns,
+    timestamp,
+    contact_url: contactUrl,
+    logs_url: logsUrl,
+    deployment_url: process.env.VERCEL_URL || 'unknown'
+  };
+}
+
+async function postFailureNotification(args) {
   const url = process.env.NOTIFY_WEBHOOK_URL;
   if (!url) return;
+  const payload = buildNotificationPayload(args);
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -469,13 +510,11 @@ const handler = async (req, res) => {
         const turns = result && result.turns;
         console.error(`[ENRICHMENT_FAILURE] contact=${contactId} reason=${reason} turns=${turns}`);
         await postFailureNotification({
-          event: 'lead_enrichment_failed',
           source: 'returned_failure',
-          contact_id: contactId,
+          contactId,
           reason,
           turns,
-          timestamp: new Date().toISOString(),
-          deployment_url: process.env.VERCEL_URL || 'unknown'
+          timestamp: new Date().toISOString()
         });
       })
       .catch(async (err) => {
@@ -483,12 +522,11 @@ const handler = async (req, res) => {
         console.error(`[ENRICHMENT_FAILURE] contact=${contactId} threw: ${msg}`);
         if (err && err.stack) console.error(err.stack);
         await postFailureNotification({
-          event: 'lead_enrichment_failed',
           source: 'thrown_error',
-          contact_id: contactId,
+          contactId,
           reason: msg.substring(0, 500),
-          timestamp: new Date().toISOString(),
-          deployment_url: process.env.VERCEL_URL || 'unknown'
+          turns: null,
+          timestamp: new Date().toISOString()
         });
       })
   );
