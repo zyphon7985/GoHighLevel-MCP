@@ -7,6 +7,8 @@
 //   - Writes enrichment back to GHL contact
 // Returns 200 to GHL within ~1s; runs enrichment async (up to maxDuration on the plan).
 
+const { waitUntil } = require('@vercel/functions');
+
 // ─── Config ────────────────────────────────────────────────────────────────
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
 const ANTHROPIC_BETA = 'mcp-client-2025-11-20';
@@ -390,16 +392,22 @@ const handler = async (req, res) => {
     received_at: new Date().toISOString()
   });
 
-  // 8. Run enrichment AFTER ack. Awaited so the function instance stays alive
-  // until completion. Errors are logged only — we cannot send a 2nd HTTP
-  // response (headers already sent above).
-  try {
-    const result = await runEnrichment(contactId);
-    console.log(`[enrich-webhook] Background enrichment complete: ${JSON.stringify(result).substring(0, 800)}`);
-  } catch (err) {
-    console.error(`[enrich-webhook] Background enrichment failed: ${err.message}`);
-    if (err.stack) console.error(err.stack);
-  }
+  // 8. Run enrichment AFTER ack. Use waitUntil() so Vercel keeps the function
+  // instance alive until the enrichment promise resolves. A bare `await` after
+  // res.json() is unreliable — Vercel can freeze the v8 context once the
+  // response is flushed. waitUntil() is the documented mechanism for extending
+  // function lifetime past the response, bounded by maxDuration. Errors are
+  // logged only — we cannot send a 2nd HTTP response (headers already sent).
+  waitUntil(
+    runEnrichment(contactId)
+      .then((result) => {
+        console.log(`[enrich-webhook] Background enrichment complete: ${JSON.stringify(result).substring(0, 800)}`);
+      })
+      .catch((err) => {
+        console.error(`[enrich-webhook] Background enrichment failed: ${err.message}`);
+        if (err.stack) console.error(err.stack);
+      })
+  );
 };
 
 module.exports = handler;
