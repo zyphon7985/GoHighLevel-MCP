@@ -1,13 +1,15 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "api/**/*.js",
-      "use": "@vercel/node"
-    }
+  "rewrites": [
+    { "source": "/enrich-webhook", "destination": "/api/enrich-webhook" },
+    { "source": "/(.*)", "destination": "/api/index" }
   ],
-  "routes": [
-    { "src": "/enrich-webhook", "dest": "/api/enrich-webhook.js" },
-    { "src": "/(.*)", "dest": "/api/index.js" }
-  ]
+  "functions": {
+    "api/enrich-webhook.js": {
+      "maxDuration": 800
+    },
+    "api/index.js": {
+      "maxDuration": 60
+    }
+  }
 }
