@@ -57,6 +57,23 @@ Fullenrich rule from the skill (Default: OFF) applies here too — do not call F
 
 Operate autonomously. Perform all writes (update_contact, update_business, create_contact_note). Do not ask for confirmation. When finished, return a brief one-paragraph summary of what was enriched and the ICP score assigned.
 
+PHASE 7 ENFORCEMENT — ALL THREE WRITES ARE MANDATORY TOOL CALLS:
+
+The Phase 7 writeback consists of THREE distinct mandatory tool_use calls. Every one of them must be issued via tool_use blocks (not just described in your text response). The Pre-Call Brief is the most valuable artifact for the sales team and the most common point of failure when agents skip step 3.
+
+REQUIRED tool_use calls (all three, every run, no exceptions):
+  1. update_contact — writes the 16 contact custom fields including ICP Score, ICP Segment, Enrichment Status, Enrichment Date
+  2. update_business — writes standard fields (website, phone, address, description) on the linked business record
+  3. create_contact_note — writes the full Pre-Call Brief as a contact note. The brief body is the actual text the sales team reads before calling.
+
+ATOMIC PARALLEL WRITES (preferred): Issue all three as parallel tool_use blocks in a single assistant turn. This is the most reliable pattern.
+
+NEVER end your turn (stop_reason=end_turn) until all three writes have been issued as tool_use calls. The synthesis text you generate is for your own reasoning trail — it does NOT replace calling create_contact_note. Writing the brief in your end_turn response is NOT sufficient; the brief must be the body argument of a create_contact_note tool_use call.
+
+Verification before ending: review the conversation history. Confirm you have issued tool_use blocks for ALL of update_contact, update_business, AND create_contact_note. If any of the three is missing, do another tool_use turn to issue the missing call(s) before ending.
+
+If a write fails (returns an error tool_result), set Enrichment Status to "Partially Enriched" via a follow-up update_contact call, but still attempt all three writes — never silently skip create_contact_note because of a non-fatal earlier error.
+
 IDEMPOTENCY GUARD: Your first action must be get_contact for the contact ID provided. Read the Enrichment Date and Enrichment Status custom fields from the response. If Enrichment Date EQUALS today's date (${today}) AND Enrichment Status is "Fully Enriched", stop immediately and return the exact text: "Skipped — contact was already enriched today." Do not call any other tools, do not perform any writes, do not re-run the pipeline. This guards against duplicate webhook fires within the same day. The 30-day freshness gate in the skill applies to manual user-driven enrichment; this same-day guard is the autonomous-webhook equivalent. Note: Enrichment Date is stored as a YYYY-MM-DD value with no time component, so an exact-match comparison is the appropriate precision here.
 
 ---
@@ -385,6 +402,47 @@ async function postFailureNotification(args) {
   }
 }
 
+// ─── Post-agent verification ───────────────────────────────────────────────
+// After the agent loop returns ok:true, check whether the Pre-Call Brief note
+// was actually created. The agent sometimes ends its turn after writing
+// custom fields and the synthesis text without issuing create_contact_note
+// as a separate tool_use call. The custom fields land via the MCP server-side
+// path but the brief is never persisted. This verification catches that.
+//
+// Returns: true (recent note exists), false (no recent note), null (could
+// not verify — treat as unknown).
+async function verifyBriefCreated(contactId, agentStartedAt) {
+  try {
+    const apiKey = process.env.GHL_API_KEY;
+    if (!apiKey) return null;
+    const baseUrl = process.env.GHL_BASE_URL || 'https://services.leadconnectorhq.com';
+    const res = await fetch(`${baseUrl}/contacts/${contactId}/notes`, {
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Version': '2021-07-28',
+        'Accept': 'application/json'
+      }
+    });
+    if (!res.ok) {
+      console.warn(`[verify] notes lookup ${res.status} for ${contactId}`);
+      return null;
+    }
+    const data = await res.json();
+    const notes = (data && data.notes) || [];
+    // A "recent" note is one created at or after the agent started. We use
+    // a small grace window (60s before agentStartedAt) to handle clock skew.
+    const cutoff = agentStartedAt - 60 * 1000;
+    const recent = notes.find((n) => {
+      const ts = new Date(n.dateAdded).getTime();
+      return Number.isFinite(ts) && ts >= cutoff;
+    });
+    return Boolean(recent);
+  } catch (err) {
+    console.error(`[verify] error: ${err.message}`);
+    return null;
+  }
+}
+
 // ─── Agent loop ────────────────────────────────────────────────────────────
 
 async function runEnrichment(contactId) {
@@ -548,11 +606,28 @@ const handler = async (req, res) => {
   // logged only — we cannot send a 2nd HTTP response (headers already sent).
   // Failures (both thrown and returned-with-ok=false) trigger an optional
   // notification webhook plus a [ENRICHMENT_FAILURE] log line for grep.
+  // Successful runs also get post-agent verification: we check that the
+  // Pre-Call Brief note was actually created and alert if not, since the
+  // agent occasionally ends its turn without issuing create_contact_note.
+  const agentStartedAt = Date.now();
   waitUntil(
     runEnrichment(contactId)
       .then(async (result) => {
         if (result && result.ok) {
-          console.log(`[enrich-webhook] Background enrichment complete: ${JSON.stringify(result).substring(0, 800)}`);
+          const briefCreated = await verifyBriefCreated(contactId, agentStartedAt);
+          if (briefCreated === false) {
+            console.error(`[ENRICHMENT_FAILURE] contact=${contactId} agent reported ok:true but no recent Pre-Call Brief note found — Write 3 was skipped`);
+            await postFailureNotification({
+              source: 'missing_brief',
+              contactId,
+              reason: 'Agent reported success but did not call create_contact_note. Custom fields landed but the Pre-Call Brief was not persisted to GHL.',
+              turns: result.turns,
+              timestamp: new Date().toISOString()
+            });
+            return;
+          }
+          const verifyTag = briefCreated === true ? ' (brief verified)' : ' (brief unverified)';
+          console.log(`[enrich-webhook] Background enrichment complete${verifyTag}: ${JSON.stringify(result).substring(0, 800)}`);
           return;
         }
         const reason = (result && result.error) || 'unknown';
