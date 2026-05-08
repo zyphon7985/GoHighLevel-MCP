@@ -546,11 +546,17 @@ Steps to perform, in order:
    - low_fit: who, company, lead_source, low_fit_icp_notes, low_fit_possible_angles, opening_angles[2-3], contact_info
    - failure: failure_what_we_know, failure_what_we_tried, failure_next_steps, opening_angles[2-3], who is optional
 
-OPENING_ANGLES is MANDATORY for every classification — never empty. Provide 2-3 numbered, ready-to-use opening lines. When data is thin (low confidence, sparse research), anchor openers on lead source, form responses, geography, or company name and explicitly note the limitation inside the array text.
+OPENING_ANGLES is MANDATORY for every classification, never empty. Provide 2-3 ready-to-use opening lines as separate array entries. DO NOT prefix entries with "1.", "2.", "3.", or any leading numbering, Stage 3 numbers them automatically when assembling the brief. Each array entry should start directly with the opener text or the leading quote. When data is thin (low confidence, sparse research), anchor openers on lead source, form responses, geography, or company name and explicitly note the limitation inside the array text.
 
 Section content is plain prose. Do not include emoji headers, "WHO HE/SHE IS:" prefixes, or section labels. Stage 3 wraps content with the appropriate template scaffolding based on classification.
 
-WRITING STYLE: do not use em dashes (—) or en dashes (–) anywhere in section content. Use commas, periods, parentheses, or restructure the sentence. Hyphens (-) are fine for compound modifiers like "design-build" or "ground-up". This applies to every brief section including opening_angles, icp_scoring_breakdown, and contact_info.
+WRITING STYLE, ABSOLUTE RULE: do not use em dashes (—) or en dashes (–) anywhere in any field of emit_enrichment. This includes brief sections (who, company, why_fits, opening_angles, etc.), icp_segment, icp_scoring_breakdown, engagement_signal, contact_info, name_corrections, and every other string. Use commas, periods, semicolons, parentheses, or restructure the sentence. Hyphens (-) are fine for compound modifiers like "design-build", "ground-up", or "mid-market". Examples of the rewrite:
+- WRONG: "He runs the field, not just the office — every quote goes through him."
+- RIGHT: "He runs the field, not just the office. Every quote goes through him."
+- WRONG: "Apollo seniority tag — manager — likely undersells real authority."
+- RIGHT: "Apollo seniority tag (manager) likely undersells real authority."
+- WRONG: "Segment: Primary — Civil/Construction"
+- RIGHT: "Segment: Primary - Civil/Construction"
 
 Do not call any other tools. emit_enrichment is your only valid output. Call it exactly once.
 
@@ -930,6 +936,26 @@ function buildFailureEnrichment({ findings, partialAssistantText, contactRecord,
 
 // ─── Stage 3: Brief formatter (deterministic) ──────────────────────────────
 
+// Strip any number of leading number-dot-space prefixes from a string.
+// Example: "1. 2. text" -> "text". The synthesis stage occasionally emits
+// pre-numbered opening angle entries; Stage 3 always re-numbers, so we
+// normalize first to avoid "1. 1. text" output.
+function stripLeadingNumbering(s) {
+  if (typeof s !== 'string') return s;
+  return s.replace(/^(\s*\d+[.)]\s*)+/, '').trim();
+}
+
+// Replace em dashes and en dashes with safer punctuation. Defense-in-depth
+// safety net for Rob's no-em-dashes-in-briefs rule. The synthesis prompt
+// also instructs the model to avoid them, but model compliance isn't 100%
+// so we scrub at the formatter boundary too.
+//   " — " (parenthetical) -> ", "
+//   "—"   (no spaces)     -> ","
+function scrubDashes(s) {
+  if (typeof s !== 'string') return s;
+  return s.replace(/\s+[—–]\s+/g, ', ').replace(/[—–]/g, ',');
+}
+
 function formatBrief(enrichment, { contactName, companyName }) {
   const today = new Date().toISOString().slice(0, 10);
   const score = enrichment.icp_score != null ? enrichment.icp_score : 0;
@@ -937,12 +963,15 @@ function formatBrief(enrichment, { contactName, companyName }) {
   const segment = enrichment.icp_segment || '';
   const classification = enrichment.classification || 'failure';
   const brief = enrichment.brief || {};
-  const angles = (brief.opening_angles || []).map((line, idx) => `${idx + 1}. ${line}`).join('\n');
+  const angles = (brief.opening_angles || [])
+    .map(stripLeadingNumbering)
+    .map((line, idx) => `${idx + 1}. ${line}`)
+    .join('\n');
 
   const headerLine1 = (header) => `${header} - ${contactName || 'Unknown Contact'} / ${companyName || 'Unknown Company'}`;
 
   if (classification === 'partner') {
-    return [
+    const text = [
       headerLine1('🤝 PARTNER BRIEF'),
       `Generated: ${today} | ICP Score: ${score}/100 (Partner Classification) | Segment: ${segment}`,
       '',
@@ -961,10 +990,11 @@ function formatBrief(enrichment, { contactName, companyName }) {
       angles,
       ...(brief.contact_info ? ['', brief.contact_info] : [])
     ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return scrubDashes(text);
   }
 
   if (classification === 'low_fit') {
-    return [
+    const text = [
       headerLine1('🔍 AI ENRICHMENT PRE-CALL BRIEF'),
       `Generated: ${today} | ICP Score: ${score}/100 (${confidence} Confidence) | Segment: ${segment}`,
       '',
@@ -988,10 +1018,11 @@ function formatBrief(enrichment, { contactName, companyName }) {
       ...(enrichment.icp_scoring_breakdown ? ['', `ICP SCORING BREAKDOWN: ${enrichment.icp_scoring_breakdown}`] : []),
       ...(brief.contact_info ? ['', brief.contact_info] : [])
     ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return scrubDashes(text);
   }
 
   if (classification === 'failure') {
-    return [
+    const text = [
       '⚠️ ENRICHMENT FAILED - MANUAL RESEARCH REQUIRED',
       `Generated: ${today}`,
       '',
@@ -1010,13 +1041,14 @@ function formatBrief(enrichment, { contactName, companyName }) {
       angles,
       ...(brief.contact_info ? ['', brief.contact_info] : [])
     ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return scrubDashes(text);
   }
 
   // Default: customer
   const customerHeader = score >= 90
     ? '⭐⭐ TOP PRIORITY LEAD'
     : (brief.header_flag || '');
-  return [
+  const text = [
     headerLine1('🔍 AI ENRICHMENT PRE-CALL BRIEF'),
     `Generated: ${today} | ICP Score: ${score}/100 (${confidence} Confidence) | Segment: ${segment}`,
     ...(enrichment.engagement_signal ? [`Signal: ${enrichment.engagement_signal}`] : []),
@@ -1038,6 +1070,7 @@ function formatBrief(enrichment, { contactName, companyName }) {
     ...(enrichment.icp_scoring_breakdown ? ['', `ICP SCORING BREAKDOWN: ${enrichment.icp_scoring_breakdown}`] : []),
     ...(brief.contact_info ? ['', brief.contact_info] : [])
   ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return scrubDashes(text);
 }
 
 // ─── Stage 3: Writeback ────────────────────────────────────────────────────
