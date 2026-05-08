@@ -445,6 +445,12 @@ async function verifyBriefCreated(contactId, agentStartedAt) {
 
 // ─── Agent loop ────────────────────────────────────────────────────────────
 
+// Maximum follow-up prompts after end_turn if the Pre-Call Brief note wasn't
+// created. Each recovery prompt asks the agent to call create_contact_note.
+// Cap is small because if 2 explicit follow-ups don't get the agent to issue
+// the call, something deeper is wrong and we should fail loudly.
+const BRIEF_RECOVERY_MAX = 2;
+
 async function runEnrichment(contactId) {
   const startTime = Date.now();
   console.log(`[enrich] start contact=${contactId}`);
@@ -457,6 +463,7 @@ async function runEnrichment(contactId) {
   ];
 
   let turn = 0;
+  let briefRecoveryAttempts = 0;
   while (turn < MAX_TURNS) {
     // Deadline guard: bail before Vercel hard-kills the function so the
     // failure notification fires cleanly. Without this check, a function
@@ -511,9 +518,52 @@ async function runEnrichment(contactId) {
         .filter(b => b.type === 'text')
         .map(b => b.text)
         .join('\n');
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`[enrich] DONE in ${elapsed}s, ${turn} turns. Summary: ${finalText.substring(0, 1500)}`);
-      return { ok: true, turns: turn, elapsedSeconds: elapsed, finalText };
+      const elapsedFmt = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      // Brief verification + recovery loop. The agent occasionally ends its
+      // turn after writing the synthesis text without issuing
+      // create_contact_note as a tool_use call. We hit the GHL API to check
+      // for a recently-created note. If missing and we still have recovery
+      // budget, push a follow-up message asking the agent to call
+      // create_contact_note now and continue the loop. After the recovery
+      // cap is exhausted, return ok:false so the failure path fires a
+      // Slack alert.
+      const briefExists = await verifyBriefCreated(contactId, startTime);
+
+      if (briefExists === true) {
+        console.log(`[enrich] DONE in ${elapsedFmt}s, ${turn} turns (brief verified). Summary: ${finalText.substring(0, 1500)}`);
+        return { ok: true, turns: turn, elapsedSeconds: elapsedFmt, finalText, briefVerified: true };
+      }
+
+      if (briefExists === null) {
+        // Verification couldn't run (no API key, network, etc). Don't block
+        // on it — return success and let the .then handler log it as
+        // "(brief unverified)".
+        console.log(`[enrich] DONE in ${elapsedFmt}s, ${turn} turns (brief unverified — verification skipped). Summary: ${finalText.substring(0, 1500)}`);
+        return { ok: true, turns: turn, elapsedSeconds: elapsedFmt, finalText, briefVerified: null };
+      }
+
+      // briefExists === false: agent ended without creating the note.
+      if (briefRecoveryAttempts < BRIEF_RECOVERY_MAX) {
+        briefRecoveryAttempts++;
+        console.warn(`[enrich] end_turn at ${elapsedFmt}s but no Pre-Call Brief note found in GHL — recovery attempt ${briefRecoveryAttempts}/${BRIEF_RECOVERY_MAX}`);
+        messages.push({ role: 'assistant', content: assistantContent });
+        messages.push({
+          role: 'user',
+          content: `Phase 7 verification: I just queried GHL via the contacts/${contactId}/notes API and confirmed that create_contact_note was NOT issued during this run. The other writes (update_contact, update_business) appear to have completed, but the Pre-Call Brief note has not been persisted.\n\nThe Pre-Call Brief is the most valuable artifact for the sales team — it cannot be skipped. Issue create_contact_note RIGHT NOW as a tool_use call, with the body argument set to the full Pre-Call Brief in the format defined by the skill for this contact's classification (Customer / Partner / Low-Fit / Failure). Do not summarize or paraphrase — write the complete brief with all required sections including OPENING ANGLES.\n\nAfter create_contact_note returns successfully, you may end your turn. Do not call any other tools.`
+        });
+        continue; // re-enter the while loop, agent gets another chance
+      }
+
+      // Recovery exhausted. Return failure so .then triggers a Slack alert.
+      console.error(`[enrich] DONE in ${elapsedFmt}s, ${turn} turns — brief still missing after ${BRIEF_RECOVERY_MAX} recovery attempts`);
+      return {
+        ok: false,
+        turns: turn,
+        elapsedSeconds: elapsedFmt,
+        finalText,
+        error: `brief_missing_after_${BRIEF_RECOVERY_MAX}_recovery_attempts: agent ended cleanly but never issued create_contact_note despite explicit follow-up prompts`
+      };
     } else {
       console.warn(`[enrich] unexpected stop_reason: ${response.stop_reason}`);
       break;
@@ -606,27 +656,19 @@ const handler = async (req, res) => {
   // logged only — we cannot send a 2nd HTTP response (headers already sent).
   // Failures (both thrown and returned-with-ok=false) trigger an optional
   // notification webhook plus a [ENRICHMENT_FAILURE] log line for grep.
-  // Successful runs also get post-agent verification: we check that the
-  // Pre-Call Brief note was actually created and alert if not, since the
-  // agent occasionally ends its turn without issuing create_contact_note.
-  const agentStartedAt = Date.now();
+  // runEnrichment now handles brief verification + recovery internally.
+  // If it returns ok:true, the brief either landed or was unverifiable
+  // (e.g., GHL API key missing). If it returns ok:false with reason
+  // "brief_missing_after_N_recovery_attempts", recovery was exhausted and
+  // we fire a Slack alert via the standard failure path below.
   waitUntil(
     runEnrichment(contactId)
       .then(async (result) => {
         if (result && result.ok) {
-          const briefCreated = await verifyBriefCreated(contactId, agentStartedAt);
-          if (briefCreated === false) {
-            console.error(`[ENRICHMENT_FAILURE] contact=${contactId} agent reported ok:true but no recent Pre-Call Brief note found — Write 3 was skipped`);
-            await postFailureNotification({
-              source: 'missing_brief',
-              contactId,
-              reason: 'Agent reported success but did not call create_contact_note. Custom fields landed but the Pre-Call Brief was not persisted to GHL.',
-              turns: result.turns,
-              timestamp: new Date().toISOString()
-            });
-            return;
-          }
-          const verifyTag = briefCreated === true ? ' (brief verified)' : ' (brief unverified)';
+          const verifyTag =
+            result.briefVerified === true ? ' (brief verified)'
+            : result.briefVerified === null ? ' (brief unverified — verification skipped)'
+            : '';
           console.log(`[enrich-webhook] Background enrichment complete${verifyTag}: ${JSON.stringify(result).substring(0, 800)}`);
           return;
         }
@@ -634,7 +676,7 @@ const handler = async (req, res) => {
         const turns = result && result.turns;
         console.error(`[ENRICHMENT_FAILURE] contact=${contactId} reason=${reason} turns=${turns}`);
         await postFailureNotification({
-          source: 'returned_failure',
+          source: /brief_missing/i.test(reason) ? 'missing_brief' : 'returned_failure',
           contactId,
           reason,
           turns,
