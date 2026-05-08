@@ -1,153 +1,138 @@
-// Lead Enrichment Webhook — Phase 2 (full enrichment via Anthropic API)
-// Receives "new lead" webhook from GHL → kicks off Claude agent loop:
-//   - Reads contact + business from GHL via MCP server
-//   - Calls Apollo for person + company enrichment
-//   - Calls Firecrawl for website scraping
-//   - Synthesizes ICP score + pre-call brief
-//   - Writes enrichment back to GHL contact
-// Returns 200 to GHL within ~1s; runs enrichment async (up to maxDuration on the plan).
+// Lead Enrichment Webhook v3 — three-stage architecture
+//
+// Stage 1 (Research): multi-turn agent loop with read-only GHL helpers
+//   (direct HTTPS) plus Apollo and Firecrawl tools. Terminates by calling
+//   emit_research_findings with a structured payload. Has no write tools.
+//
+// Stage 2 (Synthesis): single Anthropic call with tool_choice forced to
+//   emit_enrichment. Returns parsed structured JSON covering classification,
+//   ICP score, all 16 contact custom field values, business standard fields,
+//   name corrections, and brief sections.
+//
+// Stage 3 (Writeback): function-side, deterministic. Selects the brief
+//   template by classification, formats it, and issues exactly one each of
+//   update_contact, update_business, create_contact_note via direct GHL
+//   HTTPS. No agent involvement, no recovery loops, no verification needed.
+//
+// All previous robustness defenses preserved: waitUntil() lifecycle, retry
+// with adaptive timeouts on Anthropic calls, 750s deadline guard, Slack
+// alerts on failure, today's-date injection, function-level same-day
+// idempotency guard.
 
 const { waitUntil } = require('@vercel/functions');
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
-const ANTHROPIC_BETA = 'mcp-client-2025-11-20';
-const MODEL = 'claude-sonnet-4-6';  // Switch to 'claude-opus-4-7' for max quality at ~5x cost
-const MAX_TOKENS_PER_TURN = 4096;
-const MAX_TURNS = 30;  // Safety cap on agent loop iterations
-// Per-turn fetch timeout for the Anthropic API (first attempt). Tuned for
-// the 800s Vercel Pro Fluid Compute ceiling. A normal turn returns in
-// 5-30s; 180s gives heavy turns (large accumulated context + content-rich
-// tool results) plenty of room to complete without retrying.
+const MODEL = 'claude-sonnet-4-6';
+const MAX_TOKENS_RESEARCH = 4096;
+const MAX_TOKENS_SYNTHESIS = 8192;
+const MAX_RESEARCH_TURNS = 30;
 const PER_TURN_TIMEOUT_MS = 180 * 1000;
-// Total enrichment budget. We proactively bail before this elapsed time so
-// postFailureNotification has a chance to fire cleanly. Vercel hard-kills
-// the function at maxDuration (800s on Pro Fluid Compute) without unwinding
-// the promise chain, which would otherwise drop the .catch handler and
-// skip the Slack alert. 50s of cleanup headroom keeps the alert path
-// reliable.
+const SYNTHESIS_TIMEOUT_MS = 240 * 1000;
 const ENRICHMENT_DEADLINE_MS = 750 * 1000;
 
-// The lead-enrichment skill content, JSON-escaped at build time so it can be
-// embedded as a JS string literal. The agent's system prompt wraps this with
-// a small preamble explaining tool names in this environment.
-const SKILL_CONTENT = "---\nname: lead-enrichment\ndescription: >\n  Enrich GHL contacts with company intel, ICP scoring, and pre-call briefs using Apollo, Firecrawl, and AI synthesis.\n  Use this skill whenever the user says \"enrich\", \"enrich this contact\", \"enrich [name]\", \"run enrichment\",\n  \"look up this lead\", \"score this lead\", \"ICP score\", \"pre-call brief\", \"research this company for sales\",\n  \"what do we know about [company]\", \"fill in the data on [contact]\", \"enrich all contacts tagged [X]\",\n  \"batch enrich\", or any variation of wanting a GHL contact's data filled in with company intelligence\n  and sales readiness scoring. Also trigger when the user pastes a contact name or company name and\n  wants to know if they're a good fit. This skill is for TerraGenie's GHL CRM — it writes enrichment\n  data directly to contact custom fields and business records.\n---\n\n# Lead Enrichment Pipeline v2.2\n\nEnrich GHL contacts with company intelligence, ICP scoring, and AI-generated pre-call briefs. This skill orchestrates a waterfall across Apollo (person + company data), Firecrawl (website intelligence), multi-source fallbacks (Sunbiz, Google Maps, LinkedIn), and optionally Fullenrich (email/phone verification), then synthesizes everything into an ICP score with confidence modifiers and writes it all back to GHL.\n\n**v2.2 changes (from TerraGenie sales team feedback):**\n- Landscaping/hardscaping/grading reclassified as Primary ICP (35/35 Industry) — they do layout, grade checking, and excavation daily and are core TerraGenie customers\n- Expanded ICP to include any company that regularly puts equipment in the ground: irrigation, paving, fencing, solar ground-mount, septic/drain, demolition\n- Pool builders upgraded from Adjacent to Primary (30/35) — heavy excavation + utility detection needs\n- Conversation starters (OPENING ANGLES) now MANDATORY on every pre-call brief regardless of data quality — sales team reports these are the single most valuable part of the enrichment\n- When enrichment data is thin, conversation starters anchor on lead source, form responses, and industry context with explicit note about data limitations\n- Softened Non-ICP language — removed directives like \"do not pursue\" and \"remove from pipeline.\" Briefs present facts and let the sales team decide\n- Non-ICP brief template rewritten: factual tone, no negative directives, always includes opening angles\n\n**v2.1 changes (from Batch 1-3 learnings, 30 contacts enriched):**\n- Non-ICP classification path for contacts outside TerraGenie's market (property managers, RE brokers, etc.)\n- Real estate taxonomy: RE developers (Adjacent, builds things) vs RE brokers/property managers (Non-ICP)\n- Apollo org credit optimization: check `person.organization` before spending a separate org credit\n- Geographic scoring revised: project footprint matters, not office/HQ location. Central FL = top score\n- Revenue scoring fixed: proportional tiers, no penalty for large companies (they're whales)\n- Enrichment Status criteria formalized with specific conditions\n- Company name AND contact name auto-correction during writeback (typos + capitalization)\n- Pre-call brief template updated to match production narrative style\n\n**v2.0 changes:** Domain discovery intercept for personal emails, Firecrawl raw-markdown self-synthesis (no more hallucinated jq filters), multi-source fallback chain when Apollo org returns empty, confidence modifiers on ICP scores, partner/adjacent classification gate for non-ICP contacts.\n\n## When to Use This Skill\n\n- Single contact: \"Enrich Jonathan Bell\" or \"Enrich contact ID xyz\"\n- Batch: \"Enrich all contacts tagged d2d\" or \"Enrich contacts in the prospecting stage\"\n- Research: \"What do we know about INB Homes?\" or \"Is this contact a good fit?\"\n- Re-enrichment: \"Re-enrich [name]\" (overrides the 30-day freshness check)\n\n## Connector Rules\n\nThis skill operates in the **Consulting** context. Use only:\n- **GHL MCP** (prefix `mcp__baacf2a8`) — contact/business reads and writes\n- **Apollo MCP** (prefix `mcp__1dd65755`) — person and company enrichment\n- **Firecrawl MCP** (standalone, prefix `mcp__firecrawl`) — website scraping and search\n- **Fullenrich** (via GHL MCP tools) — email/phone verification (optional, credit-gated)\n\nDo NOT use Zapier MCP Google Workspace tools, Figma, or GitHub — those are Aurora connectors.\n\n---\n\n## Pipeline Phases\n\n### Phase 1 — Input & Identification\n\n1. Accept a contact name, contact ID, or search query\n2. Search or fetch the contact via `search_contacts` or `get_contact`\n3. Pull the linked business record via `get_business` if `businessId` exists\n4. Read existing custom field values to check what's already populated\n5. **Freshness gate:** If `Enrichment Status` = \"Fully Enriched\" AND `Enrichment Date` < 30 days old, ask the user before proceeding: \"This contact was enriched on [date]. Re-enrich anyway?\"\n6. Extract the company domain from the email address (everything after @) or from the business website field\n\n**Output:** A working record with all known data points and identified gaps.\n\n### Phase 1.5 — Domain Discovery (Pre-Apollo Intercept)\n\nBefore spending Apollo credits, check whether the contact's email domain is usable for company enrichment. Many leads — especially from door-to-door (d2d) campaigns — use personal email providers, which means the email domain tells us nothing about the company.\n\n**Personal email providers to intercept:** gmail.com, yahoo.com, hotmail.com, outlook.com, aol.com, icloud.com, me.com, mac.com, live.com, msn.com, comcast.net, att.net, verizon.net, sbcglobal.net, bellsouth.net, cox.net, charter.net, earthlink.net, protonmail.com, zoho.com, mail.com, ymail.com\n\n**If the email domain is personal (or no email exists):**\n\n1. Check the GHL business record's `website` field — if populated, extract the domain and use it\n2. If no business website, check if Apollo person match (Phase 2) returns an `organization.website_url` — use that\n3. If still no domain after Phase 2, run `firecrawl_search` with query: `\"[Company Name] [City, State] site\"` to discover the website\n4. If Firecrawl search finds a plausible match, verify it by checking whether the company name appears on the page (scrape and confirm)\n5. Once a domain is discovered, store it for use in Phase 3 (Apollo org) and Phase 4 (Firecrawl scrape)\n\n**If the email domain is NOT personal:** Use it directly as the company domain. Proceed normally.\n\nThis intercept prevents wasting an Apollo org credit on `gmail.com` and ensures smaller companies without corporate email still get full enrichment. The key insight: discovering the domain early unlocks the entire downstream pipeline.\n\n### Phase 2 — Apollo Person Enrichment\n\n**Tool:** `apollo_people_match`\n\n**Minimum data required:** First name + last name + (email OR domain). If last name is missing, skip this phase entirely — Apollo cannot match on first name alone.\n\n**Input parameters:** `first_name`, `last_name`, `email`, `domain`, `organization_name`\n\n**Data captured:**\n- Job title → **Company Position** field\n- LinkedIn URL → **LinkedIn URL** field\n- Seniority level → feeds **Decision Maker** logic in Phase 6\n- Company domain (if we didn't have it — critical for Phase 3)\n\n**Cost:** 1 Apollo credit per person\n\n**If no match:** Note the gap and continue. Firecrawl becomes more important.\n\n### Phase 3 — Apollo Company Enrichment\n\n**Tool:** `apollo_organizations_enrich`\n\n**Minimum data required:** Company domain. If no domain is available (not from email, not from business record, not discovered in Phase 1.5 or Phase 2), skip this phase.\n\n**⚡ Credit optimization — check Phase 2 data first:** Before calling `apollo_organizations_enrich`, check whether Phase 2's person match returned a populated `person.organization` object. If `person.organization` contains meaningful data (industry, estimated_num_employees, short_description, and/or annual_revenue), **use that data and skip the separate org enrichment call** to save 1 Apollo credit. The person match often embeds rich org data — especially when the org itself is too small/new to return data from the standalone endpoint. Only call `apollo_organizations_enrich` separately when:\n- Phase 2's `person.organization` is null or empty\n- Phase 2's `person.organization` exists but is missing key fields you need (industry, employee count, description)\n- You want to double-check or supplement thin person-embedded org data\n\n**Input:** `domain`\n\n**Data captured:**\n- Industry → **Industry** field\n- Employee count → maps to **Company Size Tier** in Phase 6\n- Annual revenue → maps to **Revenue Tier** in Phase 6\n- Founded year → **Year Founded** field\n- HQ address (street, city, state, zip) → Business standard fields\n- Phone → Business phone field\n- Description → Business description field\n- Website URL → Business website field AND **Company Website** contact custom field\n\n**Cost:** 1 Apollo credit per organization (skip if person.organization is sufficient — see above)\n\n**Empty result handling:** If Apollo returns an empty object `{}` or a result with no meaningful data (no industry, no employees, no revenue), this is common for smaller/newer companies. Do NOT treat this as final — proceed to Phase 4 and Phase 4b for alternative data sources. Flag the contact for multi-source fallback.\n\n**Batch optimization:** If multiple contacts share the same company domain, enrich the org only once and reuse the data. Use `apollo_organizations_bulk_enrich` for up to 10 domains at once in batch mode.\n\n### Phase 4 — Firecrawl Website Intelligence (Self-Synthesis)\n\nThis phase captures TerraGenie-specific intelligence that Apollo doesn't provide — what services the company offers, where they operate, and signals that indicate product fit.\n\n**Critical rule: YOU are the synthesizer.** Firecrawl returns raw page content. You read it and extract the intelligence yourself. Never rely on Firecrawl's auto-generated extraction filters or jq transforms — they hallucinate generic content that looks plausible but is fabricated. Bad data is worse than no data. The sales team makes calls based on what we write here.\n\n**Primary tool:** `firecrawl_scrape` with `onlyMainContent: true` and `formats: [\"markdown\"]`\n\n**Process:**\n1. Scrape the company homepage as raw markdown\n2. Read the returned markdown yourself and extract:\n   - Services offered (construction types, specialties, project types)\n   - Geographic service areas (cities, counties, regions, states)\n   - Company description / mission / about content\n   - Team size, certifications, years in business, notable projects\n   - Equipment or technology mentions (GPS, drones, 3D scanners, laser scanning — signals TerraGenie fit)\n   - Whether the company is a **direct customer prospect** vs. a **technology vendor/supplier/partner**\n3. If the homepage is thin on detail, also scrape `/about`, `/services`, or `/our-work` if those paths exist (check the markdown for nav links)\n\n**Hallucination check:** After extracting data from Firecrawl, sanity-check the results:\n- Does the extracted industry/services actually match the company name and domain?\n- If you're processing a batch, compare the extracted text against previous contacts — if two different companies produce identical service descriptions, the data is hallucinated. Discard it and note \"Firecrawl extraction unreliable\" in the enrichment source.\n- If the scrape returns very generic content (e.g., \"Commercial construction, office/medical building renovation, remodeling\" with no company-specific details), treat it as low-confidence and flag it.\n\n**Fallback chain:**\n1. If scrape times out (>30s), try `firecrawl_search` with the company name + location\n2. If no domain exists, go straight to `firecrawl_search` to try to find the company website\n3. If Firecrawl search also fails, proceed to Phase 4b (multi-source fallback)\n\n**Data captured:**\n- Services analysis → feeds **ICP Segment** logic in Phase 6\n- Geographic areas → **Service Area** field\n- Additional company details → supplements Business description\n- Discovered company URL → **Company Website** contact field + Business website field (if not already populated from Apollo)\n\n### Phase 4b — Multi-Source Fallback Chain (When Apollo Org Returns Empty)\n\nWhen Apollo org enrichment returns empty or Firecrawl scrape yields insufficient data, don't stop — there are free/low-cost sources that can fill the gaps. The goal is to gather enough data for a confident ICP score. Use these sources in order until you have what you need:\n\n**Source 1: Firecrawl Search (Google Index)**\n- Already attempted in Phase 4 fallback, but try broader queries if the first attempt was narrow\n- Query patterns: `\"[Company Name] construction Florida\"`, `\"[Company Name] contractor [City]\"`\n- Good for: finding the company website, basic description, service area\n\n**Source 2: Sunbiz.org (Florida Division of Corporations)**\n- Use `firecrawl_scrape` on `https://search.sunbiz.org/` or `firecrawl_search` with `\"[Company Name] site:sunbiz.org\"`\n- Good for: confirming the company exists, registered agent, filing date (proxy for year founded), registered address (proxy for geography), officer names (confirms decision-maker status)\n- Free, no credits required\n- Especially valuable for Florida-based companies that are too small for Apollo\n\n**Source 3: Google Maps / Google My Business**\n- Use `firecrawl_search` with `\"[Company Name] [City] site:google.com/maps\"` or search for the company name + \"reviews\"\n- Good for: confirming address/geography, business category (construction, landscaping, etc.), review count (proxy for company activity level), phone number, website URL\n- Free, no credits required\n\n**Source 4: LinkedIn Company Page**\n- Use `firecrawl_search` with `\"[Company Name] site:linkedin.com/company\"`\n- Good for: employee count, industry classification, company description, headquarters location\n- Free, no credits required\n- Note: LinkedIn scraping may return limited data; use what's available\n\n**When to stop the fallback chain:** You have enough data when you can confidently score at least 3 of the 6 ICP factors (Industry, Geography, Decision Maker, Company Size, Revenue, Digital Presence). If after all sources you still can't score 3 factors, mark the contact as \"Enrichment Failed\" and move on.\n\n**Source tracking:** Add each source that returned usable data to the Enrichment Source field. Example: `\"Apollo | Firecrawl | Sunbiz | AI Synthesis\"`\n\n### Phase 5 — Fullenrich Email/Phone Verification (Optional)\n\n**Default: OFF.** Only runs when explicitly requested (\"enrich with verification\", \"verify this email\") or when the contact has no email at all.\n\n**Tools:** `fullenrich_check_credits` → `fullenrich_submit_batch` → `fullenrich_get_results`\n\n**Process:**\n1. Check credit balance first — report to user\n2. Submit contact with firstname, lastname, domain or company_name, and ghl_contact_id\n3. Poll `fullenrich_get_results` until status is complete (may take 30s–3min)\n4. Write result to **Verified Email** field: \"Valid\", \"Invalid\", \"Catch-All\", or \"Unverified\"\n\n**Cost:** 1 credit per email find, 3 per personal email, 10 per mobile phone. Always announce cost before running.\n\n### Phase 6 — AI Synthesis\n\nThis phase takes all raw data from Phases 2–5 and produces the intelligence layer. No external tools — pure reasoning.\n\n#### Step 1: Classification Gate (Partner / Non-ICP / Customer)\n\nBefore scoring, determine what category this contact falls into. The ICP rubric is designed for customers — scoring a property management company or software vendor against it produces misleading numbers. Classify first, then score.\n\n**Classification A — Partner/Vendor (not a buyer, but has referral/integration potential):**\n- Company sells software, technology, or SaaS products (not construction services)\n- Company manufactures or distributes equipment, materials, or supplies\n- Company provides professional services to construction companies (insurance, legal, HR, staffing)\n- Apollo industry classification is \"Information Technology\", \"Computer Software\", \"Staffing\", etc.\n- Website describes products/platforms rather than project work or field operations\n\n→ Set ICP Segment = `\"Partner — [Type]\"` (e.g., \"Partner — Technology Vendor\", \"Partner — Supplier\")\n→ Still calculate the ICP score using the customer rubric, but use the Partner Pre-Call Brief format\n→ Reframe the brief to focus on partnership/referral potential\n\n**Classification B — Non-ICP (wrong industry entirely, no TerraGenie fit):**\n- Company is in an industry with no construction, excavation, surveying, or site work connection\n- Common Non-ICP industries encountered in TerraGenie's lead pool:\n  - **Real estate brokerages/agents** — they sell/list existing properties, they don't build. Company names can be misleading (e.g., \"21 New Homes\" is a brokerage, not a builder). Check for MLS participation, \"listing specialist,\" \"buyer's agent\" language.\n  - **Property management companies** — they manage/maintain existing properties, they don't excavate or do site work. Look for \"tenant screening,\" \"rent collection,\" \"leasing\" in their description.\n  - **Real estate holding companies** (without active development) — passive investors, not builders\n  - **Insurance, financial services, staffing agencies** that happen to serve construction clients\n- Key test: **Does this company ever put a shovel in the ground?** If the answer is no, it's likely a low-fit lead. But even then, present the facts without negative directives — the sales team decides what to pursue.\n- **Important: Landscaping IS a shovel-in-the-ground industry.** Landscapers do layout, grading, excavation, irrigation trenching, hardscaping, and drainage work. They are PRIMARY ICP, not adjacent or non-ICP. If Apollo or any other source classifies a company as \"landscaping\" — that's a green flag, not a red one.\n\n→ Set ICP Segment = `\"Low Fit — [Industry]\"` (e.g., \"Low Fit — Property Management\", \"Low Fit — Real Estate Brokerage\")\n→ Calculate the ICP score normally (it will naturally be lower due to industry mismatch)\n→ Use the Low-Fit Pre-Call Brief format (see below) — factual tone, includes conversation starters, no negative directives\n→ Header: `ℹ️ LOW ICP MATCH — SEE NOTES` (informational flag, not a directive to stop outreach)\n\n**Classification C — Customer (potential TerraGenie buyer):**\nEverything else — construction, surveying, infrastructure detection, **landscaping/hardscaping** (Primary — they do layout, grading, and excavation daily), **pool construction** (Primary — heavy excavation), **irrigation/paving/fencing/solar/septic/demolition** (Primary — regular ground disturbance), and importantly:\n- **Real estate DEVELOPERS** — they DO build things. They commission ground-up construction, manage site work, and need utility detection during development. Look for \"development,\" \"ground-up,\" \"mixed-use,\" \"multi-family construction,\" active project portfolios, \"design-build\" language. These are **Adjacent** segment, not Non-ICP.\n\n→ Proceed with normal ICP scoring and customer Pre-Call Brief format\n\n**The real estate distinction is critical:** Apollo tags developers, brokers, and property managers all as `industry: \"real estate\"`. You MUST look at the company description, services, and website content to distinguish them. The key question: **does this company build, develop, or do ground-up construction?** If yes → Adjacent customer. If they just sell, lease, or manage → Non-ICP.\n\n#### Step 2: ICP Score (0–100)\n\nUnknowns score 0. The score only reflects confirmed data. A low score on a sparse contact means \"we don't know enough\" — not \"they're a bad fit.\"\n\n| Factor | Max Points | Scoring |\n|--------|:----------:|---------|\n| **Industry fit** | 35 | Construction/Civil/GC = 35, Landscaping/Hardscaping/Grading = 35 (layout + grade checking + excavation = core TerraGenie use case), Pool Construction = 30 (heavy excavation + utility detection), RE Developer (ground-up construction) = 25, Surveying = 28, Infrastructure Detection = 22, Irrigation/Paving/Fencing/Solar Ground-Mount/Septic/Demolition = 25 (regular ground disturbance + utility locate needs), Engineering/Inspections (adjacent) = 20, RE Brokerage/Property Mgmt/Unrelated = 5, Guessed from company name only = 5, Unknown = 0 |\n| **Geographic fit** | 25 | Central FL project footprint = 25, Other FL project footprint (South, North, Panhandle) = 22, FL statewide / multi-region FL = 24, Confirmed FL projects but primarily out-of-state = 18, Southeast US (no confirmed FL activity) = 10, Other US = 5, Inferred from area code only = 8, Unknown = 0 |\n| **Decision maker** | 15 | C-suite/VP/SVP/Owner = 15, Director/Partner = 12, Manager = 8, Individual contributor = 3, Gatekeeper (admin/assistant/receptionist) = 2, Unknown = 0 |\n| **Company size** | 15 | Mid-Market (51-200) = 15, Small (11-50) = 12, Enterprise (200+) = 8, Micro (1-10) = 5, Unknown = 0 |\n| **Revenue** | 5 | $50M+ = 5 (whale — multi-project recurring potential), $10M-$50M = 5 (strong mid-market), $5M-$10M = 4, $1M-$5M = 3, Under $1M = 1, Unknown = 0 |\n| **Digital presence** | 5 | Full website with services = 5, Website but thin content = 3, No website = 0 |\n\n**Geography scoring note:** Score based on where the company does PROJECTS, not where their office or HQ is located. A company HQ'd in Illinois with active FL project sites scores on the FL tier matching their project footprint. Look for: service area on website, project portfolio locations, \"florida\" in Apollo keywords, FL license records, FL-tagged in GHL. Office location is a secondary signal, not the primary one.\n\n**Gatekeeper modifier:** If the contact's title indicates they're an admin, assistant, receptionist, office manager, or similar non-decision-making role, cap the Decision Maker factor at 2 points. These contacts can still be valuable as entry points but shouldn't inflate the score.\n\n#### Step 3: Confidence Modifier\n\nAfter calculating the raw ICP score, assess how much of it is based on confirmed data vs. gaps. This helps the sales team distinguish between \"we know they're a 45\" and \"we're guessing they're a 45.\"\n\n| Confidence Level | Criteria | Display |\n|:----------------:|----------|---------|\n| **High** | 5-6 of 6 factors have real data (not \"Unknown = 0\") | `ICP: 85/100 (High Confidence)` |\n| **Medium** | 3-4 of 6 factors have real data | `ICP: 65/100 (Medium Confidence)` |\n| **Low** | 2 of 6 factors have real data | `ICP: 40/100 (Low Confidence)` |\n| **Very Low** | 0-1 of 6 factors have real data | `ICP: 15/100 (Very Low Confidence — manual research needed)` |\n\nThe confidence level is displayed alongside the ICP score in the Pre-Call Brief and in the batch summary table. It does NOT change the numeric score — it provides context for interpreting it.\n\n#### Step 4: ICP Segment\n\nDerived from the services/industry analysis:\n\n**Customer segments:**\n- **Primary — Civil/Construction:** civil engineering, general contracting, residential construction, commercial construction, excavation, grading, site work\n  - Sub-segments: `Residential`, `Commercial`, `Civil/Infrastructure`, `General Contractor`\n- **Primary — Landscaping/Hardscaping:** commercial landscaping, hardscaping, landscape grading, land clearing, outdoor construction. These companies do layout, grade checking, and excavation on virtually every job — they are core TerraGenie customers, not adjacent. Includes companies that do retaining walls, outdoor kitchens, drainage systems, and landscape design-build.\n  - Sub-segments: `Commercial Landscaping`, `Hardscaping`, `Landscape Design-Build`, `Land Clearing/Grading`\n- **Primary — Pool Construction:** pool builders, pool excavation. Heavy excavation work requiring utility detection before every dig. Score 30/35 on Industry.\n- **Primary — Ground Disturbance Trades:** irrigation installation, paving/asphalt, fencing, solar ground-mount, septic/drain field, demolition. Any trade that regularly trenches, excavates, or disturbs the ground needs utility detection and benefits from layout/grade tools. Score 25/35 on Industry.\n- **Secondary — Surveying:** land surveying, geospatial, boundary surveys, topographic surveys\n- **Tertiary — Infrastructure Detection:** utility locating, SUE, underground detection\n- **Adjacent — Real Estate Development:** ground-up developers doing mixed-use, multi-family, or residential development with active construction projects. Key signal: they BUILD things, not just sell/manage. Include sub-type in segment label, e.g., \"Adjacent — Real Estate Development (Mixed-Use & Multi-Family)\"\n- **Adjacent — Engineering/Inspections:** licensed professional engineers, building inspectors, testing labs that operate in the construction ecosystem\n\n**Non-customer segments:**\n- **Partner — Technology Vendor:** software, SaaS, tech products serving construction\n- **Partner — Supplier/Distributor:** materials, equipment, supplies for construction\n- **Partner — Professional Services:** insurance, legal, HR, staffing for construction\n- **Low Fit — Property Management:** companies that manage/maintain existing properties (tenant screening, leasing, rent collection). No excavation or site work. Score will be low, but present factually — they may know contractors who are a fit.\n- **Low Fit — Real Estate Brokerage:** companies that sell/list existing properties (MLS participants, listing agents, buyer's agents). Not builders. Note: company names can be misleading — \"New Homes\" in the name doesn't mean they build. May have referral value.\n- **Low Fit — Other:** any other industry without a clear construction/surveying/ground-disturbance connection. Present the facts and let the sales team decide.\n\n#### Step 5: Engagement Signal\n\nBased on what's visible in the data, note one key engagement signal for the sales team:\n- Technology mentions on website (GPS, drones, 3D scanning) → \"Tech-forward — likely receptive to new tools\"\n- Recent projects or growth signals → \"Active and growing — good timing\"\n- Multiple locations or expanding service area → \"Scaling operations — pain point for fleet/asset management\"\n- No website or minimal digital presence → \"Traditional operator — may need education on tech value\"\n\nInclude this as a one-liner in the Pre-Call Brief under the ICP score.\n\n#### Field Mappings\n\n| Derived Field | Source Logic |\n|---------------|-------------|\n| Company Size Tier | Apollo `estimated_num_employees`: 1-10 → \"Micro (1-10)\", 11-50 → \"Small (11-50)\", 51-200 → \"Mid-Market (51-200)\", 200+ → \"Enterprise (200+)\" |\n| Revenue Tier | Apollo `annual_revenue`: <1M → \"Under $1M\", 1-5M → \"$1M-$5M\", 5-10M → \"$5M-$10M\", 10-50M → \"$10M-$50M\", 50-100M → \"$50M-$100M\", 100M+ → \"$100M+\" |\n| Decision Maker | Apollo `seniority`: c_suite/vp/owner → \"Yes\", director/partner → \"Yes\", manager → \"Unknown\", gatekeeper titles → \"Gatekeeper\", other/null → \"Unknown\", entry_level → \"No\" |\n| Enrichment Status | See criteria below |\n\n**Enrichment Status criteria (formalized):**\n- **Fully Enriched** = At least one rich data source returned company details (industry, employee count, OR detailed services) AND contact role/title is known AND all 3 GHL writes completed successfully\n- **Partially Enriched** = Some useful data found but significant gaps remain: no company details beyond the name, OR no title/role for the contact, OR no domain/website discovered, OR one or more GHL writes could not be completed\n- **Enrichment Failed** = No meaningful data returned from any source after the full fallback chain was attempted. Set confidence to \"Very Low\" and generate the failure Pre-Call Brief with manual research next steps\n| Enrichment Source | Pipe-delimited list of sources that returned data, e.g., \"Apollo \\| Firecrawl \\| Sunbiz \\| AI Synthesis\" |\n\n#### Pre-Call Brief\n\nGenerate a narrative note for the sales team with these sections:\n\n**For customer prospects (narrative style — write for a sales rep who has 2 minutes before a call):**\n```\n🔍 AI ENRICHMENT PRE-CALL BRIEF — [Contact Name] / [Company Name]\nGenerated: [Date] | ICP Score: [X]/100 ([Confidence Level]) | Segment: [ICP Segment]\n\n[If ICP 90+: ⭐⭐ TOP PRIORITY LEAD — or similar flag]\n[If any data discrepancies: ⚠️ flags here]\n\nWHO HE/SHE IS:\n[2-4 sentences, narrative prose. Role, how long at company, career trajectory if known, what they control/decide. Write like you're briefing a colleague, not filling a form.]\n\nTHE COMPANY:\n[2-4 sentences, narrative prose. What they do, size, revenue, where they operate, notable projects or specialties. Include specific numbers when available.]\n\nLEAD SOURCE: [Source] — [one sentence on what this means for outreach context, e.g., \"proactively submitted at IBS\" or \"door-to-door cold contact\"]\n\nWHY TerraGenie FITS:\n[2-3 sentences connecting THIS specific company's operations to TerraGenie's value prop. Be specific — reference their project types, service areas, or operational model. Don't be generic.]\n\nOPENING ANGLES:\n[MANDATORY — never skip this section, even when enrichment data is thin. Generate 2-3 numbered, ready-to-use opening lines or conversation starters. When rich data is available, reference specific details from the enrichment — project names, role specifics, company milestones. The sales rep should be able to read one of these verbatim on the call. When data is sparse, anchor openers on: (1) how the lead came in (ad campaign, form submission, trade show, d2d), (2) what they selected on the form (industry, demo type), (3) their geography or company name. Add a note: \"⚠️ Limited enrichment data — these starters are based on lead source and form responses only. Ask discovery questions early to learn more about their specific needs.\"]\n\n[Optional: POTENTIAL DEAL SIZE if inferable from company scale]\n\n[Contact info: Verified Email, Phone, LinkedIn — whatever is available]\n```\n\n**For low-fit contacts (industry doesn't match core segments):**\n```\n🔍 AI ENRICHMENT PRE-CALL BRIEF — [Contact Name] / [Company Name]\nGenerated: [Date] | ICP Score: [X]/100 ([Confidence Level]) | Segment: [Low Fit — Industry]\n\nℹ️ LOW ICP MATCH — SEE NOTES\n\nWHO HE/SHE IS:\n[2-3 sentences on the person and their role]\n\nTHE COMPANY:\n[2-3 sentences — what they actually do. Be factual and neutral. Do not say \"this is not a fit\" or \"do not pursue.\"]\n\nLEAD SOURCE: [Source]\n\nICP NOTES:\n[2-3 sentences explaining factually why the ICP score is low — e.g., \"Industry is property management, which doesn't typically involve excavation or site work.\" Stay factual, not prescriptive. Never say \"do not reach out,\" \"remove from pipeline,\" or \"not worth pursuing.\"]\n\nPOSSIBLE ANGLES:\n[1-2 sentences — referral potential, edge-case connections, or discovery questions. e.g., \"They may work with builders who need utility detection — worth asking.\" If the angle is thin, say \"Limited direct fit based on available data — a short discovery call could reveal connections not visible in the enrichment.\"]\n\nOPENING ANGLES:\n[2-3 numbered conversation starters. Even for low-fit contacts, generate openers based on whatever data is available — lead source, form responses, industry, geography. These help the sales rep if they choose to make the call. If data is very thin, note: \"⚠️ Limited enrichment data — these starters are based on lead source and form responses only. Use discovery questions early.\"]\n\n[Contact info]\n```\n\n**For partner/vendor contacts:**\n```\n🤝 PARTNER BRIEF — [Contact Name] / [Company Name]\nGenerated: [Date] | ICP Score: [X]/100 (Partner Classification) | Segment: Partner — [Type]\n\nWHO THEY ARE:\n[2-3 sentences on company and contact]\n\nPARTNERSHIP POTENTIAL:\n[2-3 sentences: how this company's offering relates to TerraGenie's market]\n\nREFERRAL/INTEGRATION ANGLE:\n[2-3 sentences: specific ways to collaborate — shared customers, integrations, co-selling]\n\nCONSIDERATIONS:\n[1-2 sentences: competitive risk, alignment questions]\n\nOPENING ANGLES:\n[MANDATORY — 2-3 numbered conversation starters focused on partnership/referral angle rather than direct sale. Reference their product/service and how it intersects with TerraGenie's customer base.]\n\n[Contact info]\n```\n\n**For enrichment failures:**\n```\n⚠️ ENRICHMENT FAILED — MANUAL RESEARCH REQUIRED\n\nWHAT WE KNOW:\n[List all data points we have]\n\nWHAT WE TRIED:\n[Which sources were called and why they failed]\n\nICP SCORE: [X]/100 (Very Low Confidence) — score cannot be trusted due to insufficient data\n\nRECOMMENDED NEXT STEPS:\n[Specific actions: ask the sales rep, check sunbiz.org, reverse phone lookup, Google Maps search]\n\nOPENING ANGLES:\n[MANDATORY — even when enrichment failed, generate 2-3 basic conversation starters from whatever data exists (name, phone area code, lead source, form responses, company name). Note: \"⚠️ Very limited data — these starters use only basic lead info. The call itself is the best enrichment source.\"]\n```\n\n### Phase 7 — GHL Writeback\n\nThree write operations, all in the same turn when possible.\n\n#### Pre-Write: Name & Capitalization Correction\n\nBefore writing, check for and fix data quality issues in the contact and business records:\n\n**Company name correction:** If enrichment sources (Apollo, Firecrawl, FL license records, company website) reveal that the GHL company name has a typo or misspelling, and there is medium-to-high confidence the corrected name is accurate, **overwrite both:**\n- `companyName` on the contact record (via `update_contact`)\n- `name` on the business record (via `update_business`)\n- Examples: \"Sldom Seen Construction Inc\" → \"Seldom Seen Construction Inc\", \"21newhones\" → \"21 New Homes Inc\"\n\n**Contact name correction:** If enrichment sources reveal the contact's first or last name is misspelled AND there is medium-to-high confidence in the correction (e.g., Apollo returns a verified LinkedIn profile with a different spelling), **overwrite `firstName` and/or `lastName`** on the contact record. Include `firstName` and `lastName` parameters in the `update_contact` call.\n- Examples: if GHL has \"Jorosh\" but Apollo + LinkedIn both show \"Jarosh\", correct to \"Jarosh\"\n- If confidence is lower (only one source disagrees), flag the discrepancy in the pre-call brief instead of auto-correcting: \"⚠️ NAME DISCREPANCY: GHL has 'X' but [source] shows 'Y' — verify before outreach\"\n\n**Capitalization fix:** If contact or company names are all-lowercase or ALL-UPPERCASE in GHL, convert to proper Title Case during writeback. This is a formatting fix, not a data correction — always apply it.\n- \"cory spaziani\" → \"Cory Spaziani\"\n- \"ESSEX PROPERTY MANAGEMENT INC\" → \"Essex Property Management Inc\"\n- Include corrected `firstName`, `lastName` on the contact and `name` on the business in the respective update calls\n\n#### Write 1: Contact Custom Fields\n\nUse `update_contact` with field IDs (not fieldKeys — GHL requires IDs for reliable writes):\n\n| Field | ID | Type |\n|-------|----|:----:|\n| Company Position | `8GBZUD9i0v4YwmN5D8ql` | TEXT |\n| LinkedIn URL | `Fs3vd5aDkfmCmMi5ezR5` | TEXT |\n| Industry | `YmQKLcFMLHngYLPqNrQ1` | SINGLE_OPTIONS |\n| Decision Maker | `hug3WGqPGpmWSTDIMCbQ` | TEXT |\n| Verified Email | `KZLIXx1cqpjyxkp7nlGV` | TEXT |\n| Contact Source | `GY8ouGyz20gvT4kOchnu` | TEXT |\n| Company Size Tier | `UVccVccVWu9bEapOHcHP` | TEXT |\n| Revenue Tier | `xksJTkHj856hdcMwGB5P` | TEXT |\n| ICP Score | `huDhxJeTQwziNa1ieNhc` | NUMERICAL |\n| ICP Segment | `e0MhZI4Mz6Byy4KimPsU` | TEXT |\n| Service Area | `JVDIFcZbbIg9q3rKeEOP` | TEXT |\n| Year Founded | `tZjxUT4WsJwGQGtraUZM` | NUMERICAL |\n| Enrichment Date | `mKxoh4updlE5gTHn5rE4` | DATE |\n| Enrichment Status | `fWKopv1EoEk7w05xUbUZ` | TEXT |\n| Company Website | `BYci9oLWTdYipwsuAzH3` | TEXT |\n| Enrichment Source | `pu7XXEeb8y0195Dj2V4S` | TEXT |\n\n**Custom field write format:** `[{\"key\": \"<field_id>\", \"field_value\": \"<value>\"}]`\n\nThe `key` parameter maps to the field `id` (not `fieldKey`). This is a GHL API quirk — the MCP's `toContactCustomFields` helper handles the remapping. For NUMERICAL fields, send the number as a string (e.g., `\"80\"`) — GHL converts it.\n\n#### Write 2: Business Standard Fields\n\nUse `update_business` with standard fields only (custom fields on Business don't work via API):\n- `website`, `phone`, `address`, `city`, `state`, `postalCode`, `country`, `description`\n- Only write fields that are currently empty — never overwrite existing business data unless the user explicitly says to\n\n**Company Website dual-write:** The company website URL is written to BOTH:\n1. Business standard `website` field (via `update_business`) — canonical source\n2. Contact custom field **Company Website** (`BYci9oLWTdYipwsuAzH3`) — visible in contact list views and smart lists\n\nSource priority for website: Apollo org `website_url` > Firecrawl discovery > email domain inference. The same URL goes to both locations.\n\n#### Write 3: Contact Note\n\nUse `create_contact_note` with the Pre-Call Brief as the body. This appears in the contact's timeline in GHL.\n\n---\n\n## Batch Mode\n\nWhen enriching multiple contacts:\n\n1. **Credit estimate:** Before starting, calculate: (number of contacts × 2 Apollo credits) + any Fullenrich credits. Announce: \"This batch of N contacts will use approximately X Apollo credits. Proceed?\"\n2. **Org deduplication:** Track domains already enriched in this batch. If 3 contacts share `inbhomes.com`, call `apollo_organizations_enrich` once and reuse the result. For 2-10 unique domains, use `apollo_organizations_bulk_enrich`.\n3. **Hallucination tracking:** In batch mode, keep a running list of Firecrawl-extracted service descriptions. If a new contact's extraction produces text identical (or near-identical) to a previous contact's, the extraction is hallucinated — discard it and note the gap.\n4. **Sequential execution:** Run the pipeline per contact, one at a time. Print a progress line after each: `[3/15] ✅ Jonathan Bell — ICP: 90 (High) — Fully Enriched`\n5. **Summary table:** After the batch completes, print:\n\n```\n| Contact | Company | ICP Score | Confidence | Segment | Status |\n|---------|---------|:---------:|:----------:|---------|--------|\n| Jonathan Bell | INB Homes | 90 | High | Primary — Civil/Construction | Fully Enriched |\n| Debby Dearth | McNally Construction | 70 | Medium | Primary — Civil/Construction | Partially Enriched |\n| Eddie | Kings Homes | 13 | Very Low | Primary — Civil/Construction | Enrichment Failed |\n| Janie Linscott | Optic Systems | 53 | High | Partner — Technology Vendor | Fully Enriched |\n\nCredits used: 5 Apollo | 0 Fullenrich\nFallback sources used: Sunbiz (2) | Google Maps (1)\n```\n\n6. **Batch limits:** Default max 25 contacts per run. Over 10, require explicit confirmation. Over 25, suggest splitting into batches.\n\n---\n\n## Error Handling\n\n| Scenario | Action |\n|----------|--------|\n| Apollo returns no person match | Set Company Position = \"Unknown\", skip LinkedIn/seniority. Note in Enrichment Source. |\n| Apollo returns no org match | Do NOT stop. Proceed to Phase 4 (Firecrawl) and Phase 4b (multi-source fallback). Flag for fallback chain. |\n| Apollo org returns empty `{}` | Same as no match — common for small/new companies. Proceed to Firecrawl + fallback sources. |\n| Personal email domain detected | Trigger Phase 1.5 domain discovery before Apollo org. Do not call Apollo org on gmail.com, yahoo.com, etc. |\n| Firecrawl scrape times out | Retry with `firecrawl_search`. If that also fails, proceed to Phase 4b fallback sources. |\n| Firecrawl finds wrong company | Cross-check domain against contact's email domain or company name. Discard if mismatch. |\n| Firecrawl returns hallucinated/generic content | Discard the extraction. In batch mode, compare against previous extractions — identical text across different companies = hallucinated. Note \"Firecrawl extraction unreliable\" in Enrichment Source. Proceed to Phase 4b. |\n| No domain available at all | Skip Apollo org + Firecrawl scrape. Go straight to Firecrawl search → Phase 4b fallback chain. If all fail, mark as Enrichment Failed. |\n| Contact has no last name | Skip Apollo person match entirely. Note in Pre-Call Brief. |\n| Contact is a partner/vendor, not a customer | Apply classification gate (Phase 6 Step 1). Score normally but use Partner Pre-Call Brief format. Set ICP Segment to \"Partner — [Type]\". |\n| Contact is low-fit (industry doesn't match core segments) | Apply classification gate (Phase 6 Step 1). Score normally (will be low). Use Low-Fit Pre-Call Brief format with \"ℹ️ LOW ICP MATCH — SEE NOTES\" flag. Set ICP Segment to \"Low Fit — [Industry]\". Always include OPENING ANGLES — the sales team decides whether to pursue. |\n| Company name has typo in GHL | Correct during Phase 7 Pre-Write if medium+ confidence from enrichment sources. Overwrite `companyName` on contact and `name` on business. |\n| Contact name misspelled or wrong case | If medium+ confidence correction available, fix `firstName`/`lastName` in `update_contact`. If lower confidence, flag in pre-call brief only. Always fix capitalization (all-lower/ALL-CAPS → Title Case). |\n| Apollo tags company as \"real estate\" | Do NOT auto-classify. Check description and services: RE developer (builds things) = Adjacent customer, RE brokerage (sells properties) = Low Fit, Property management (manages rentals) = Low Fit. See Phase 6 Step 1 for details. |\n| GHL write fails | Report the error. Do not retry automatically — the user should investigate. |\n| Fullenrich returns no results after polling | Set Verified Email = \"Unverified\". Note in Enrichment Source. |\n| All fallback sources exhausted with insufficient data | Mark as \"Enrichment Failed\". Set confidence to \"Very Low\". Generate the failure Pre-Call Brief with specific next steps for manual research. |\n\n---\n\n## Important Notes\n\n- **Credit awareness:** Always announce credit costs before making Apollo or Fullenrich calls. Never burn credits silently.\n- **Contact Source preservation:** If Contact Source already has a value (e.g., \"Trade Show\", \"Web Form\"), do not overwrite it. Only set it if it's currently empty.\n- **Industry field:** The Industry field on Contact (`YmQKLcFMLHngYLPqNrQ1`) is SINGLE_OPTIONS with values: Construction, Surveyors, Infrastructure Detectors, Landscape or Playgrounds, Pools, Other. Map Apollo's industry string to the closest match. For partner/vendor and low-fit contacts, use \"Other\". For RE developers with active construction, use \"Construction\". For landscaping/hardscaping companies, use \"Landscape or Playgrounds\" — these are PRIMARY ICP customers.\n- **Landscaping is Primary ICP.** This is a v2.2 change based on direct client feedback. Landscaping companies do layout, grading, excavation, and irrigation work — they need utility detection and grade-checking tools on virtually every job. Never classify a landscaping company as low-fit or adjacent. Score them at 35/35 on Industry, same as construction/civil.\n- **Date format:** Enrichment Date expects ISO format: `YYYY-MM-DD`\n- **Re-enrichment:** When re-enriching, overwrite all fields with fresh data except Contact Source.\n- **Data integrity:** Bad data is worse than no data. When in doubt about the accuracy of extracted information, mark the field as unknown rather than writing unreliable data. The sales team makes real calls based on these briefs.\n- **Source attribution:** Always track which sources contributed data in the Enrichment Source field. This helps diagnose issues and builds confidence in the data quality over time.\n- **Real estate taxonomy:** Apollo classifies developers, brokers, and property managers all as `industry: \"real estate\"`. Never trust this label alone. Always check the company description, website, and services to determine: Does this company BUILD things (→ Adjacent customer) or just sell/manage properties (→ Low Fit)? This distinction has the biggest impact on ICP accuracy for TerraGenie's lead pool.\n- **Conversation starters are the #1 value-add.** TerraGenie's sales team specifically called out OPENING ANGLES as the most helpful part of the enrichment. They help newer reps open calls confidently by connecting the prospect's business to TerraGenie's value prop. NEVER skip this section on any brief — customer, partner, low-fit, or enrichment failure. When data is thin, anchor on lead source, form responses, and industry. When data is rich, get specific about projects, services, and company details. Accuracy is critical — a hallucinated talking point can kill the relationship before it starts. When you don't have enough data for confident talking points, say so explicitly rather than making things up.\n- **Name auto-correction:** During Phase 7, fix company name typos and capitalization issues (all-lower → Title Case, ALL-CAPS → Title Case) with medium+ confidence. Fix contact name misspellings when multiple sources confirm the correction. Flag rather than correct when only one source disagrees.\n";
+const GHL_BASE_URL = process.env.GHL_BASE_URL || 'https://services.leadconnectorhq.com';
+const GHL_API_VERSION = '2021-07-28';
 
-// Build the system prompt at request time so today's date is injected
-// fresh. The agent has no real-time clock awareness — without this, it
-// will guess based on its training cutoff (e.g. claude-sonnet-4-6 will
-// pick a date months in the future), which then gets written to the
-// Enrichment Date custom field and breaks the idempotency guard on
-// subsequent runs. The prompt text only changes once per UTC day, so
-// prompt caching still works for all requests within the same day.
-function buildSystemPrompt() {
-  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD UTC
-  return `You are running as an automated lead-enrichment agent triggered by a GoHighLevel webhook (a new lead just landed). You execute the lead-enrichment skill below autonomously — there is no user to ask follow-up questions of. Make best-judgment calls and proceed.
+// Canonical contact custom field IDs. Source of truth lives in the skill;
+// this mirror is what Stage 3 uses to build the update_contact payload.
+const CONTACT_FIELDS = {
+  company_position: '8GBZUD9i0v4YwmN5D8ql',
+  linkedin_url: 'Fs3vd5aDkfmCmMi5ezR5',
+  industry: 'YmQKLcFMLHngYLPqNrQ1',
+  decision_maker: 'hug3WGqPGpmWSTDIMCbQ',
+  verified_email: 'KZLIXx1cqpjyxkp7nlGV',
+  contact_source: 'GY8ouGyz20gvT4kOchnu',
+  company_size_tier: 'UVccVccVWu9bEapOHcHP',
+  revenue_tier: 'xksJTkHj856hdcMwGB5P',
+  icp_score: 'huDhxJeTQwziNa1ieNhc',
+  icp_segment: 'e0MhZI4Mz6Byy4KimPsU',
+  service_area: 'JVDIFcZbbIg9q3rKeEOP',
+  year_founded: 'tZjxUT4WsJwGQGtraUZM',
+  enrichment_date: 'mKxoh4updlE5gTHn5rE4',
+  enrichment_status: 'fWKopv1EoEk7w05xUbUZ',
+  company_website: 'BYci9oLWTdYipwsuAzH3',
+  enrichment_source: 'pu7XXEeb8y0195Dj2V4S'
+};
 
-CURRENT DATE: ${today} (today, YYYY-MM-DD, UTC). Use this exact value when populating the Enrichment Date custom field during Phase 7 writeback. Do NOT invent, infer, or extrapolate today's date from training data, content of scraped pages, or any other source — the only source of truth for today's date is this line.
+// ─── Skill content (re-embedded; v2.3) ─────────────────────────────────────
+// The lead-enrichment skill content, embedded as a JS string literal. Source
+// of truth is the Cowork skill mount; this constant is a snapshot that must
+// be updated whenever the skill changes. Both Stage 1 and Stage 2 system
+// prompts reference this so classification/scoring/brief rules stay aligned.
+const SKILL_CONTENT = require('./_skill-content.js');
 
-Tool names available in THIS environment (ignore any "mcp__..." prefixes the skill mentions):
-- GHL tools (via MCP): search_contacts, get_contact, get_business, get_businesses, update_contact, update_business, create_contact_note, get_location_custom_fields, get_pipelines, fullenrich_check_credits, fullenrich_submit_batch, fullenrich_get_results, plus the full GHL tool set
-- apollo_people_match — Apollo person enrichment
-- apollo_organizations_enrich — Apollo company enrichment by domain
-- firecrawl_scrape — scrape a webpage as markdown
-- firecrawl_search — Google search via Firecrawl
+// ─── GHL HTTPS helpers ─────────────────────────────────────────────────────
 
-Fullenrich rule from the skill (Default: OFF) applies here too — do not call Fullenrich tools unless the contact has no email at all.
-
-Operate autonomously. Perform all writes (update_contact, update_business, create_contact_note). Do not ask for confirmation. When finished, return a brief one-paragraph summary of what was enriched and the ICP score assigned.
-
-PHASE 7 ENFORCEMENT — ALL THREE WRITES ARE MANDATORY TOOL CALLS:
-
-The Phase 7 writeback consists of THREE distinct mandatory tool_use calls. Every one of them must be issued via tool_use blocks (not just described in your text response). The Pre-Call Brief is the most valuable artifact for the sales team and the most common point of failure when agents skip step 3.
-
-REQUIRED tool_use calls (each exactly ONCE per run, every run, no exceptions):
-  1. update_contact — writes the 16 contact custom fields including ICP Score, ICP Segment, Enrichment Status, Enrichment Date
-  2. update_business — writes standard fields (website, phone, address, description) on the linked business record
-  3. create_contact_note — writes the full Pre-Call Brief as a contact note. The brief body is the actual text the sales team reads before calling.
-
-EXACTLY ONCE — DUPLICATE PREVENTION (critical):
-- Each of the three writes must be issued EXACTLY ONCE per run. Never call create_contact_note twice in parallel or in sequence — that creates duplicate notes in GHL and pollutes the contact's timeline.
-- Do not issue a second create_contact_note "in case the first one fails" or "with refined wording." Generate the FINAL complete brief text first, then issue create_contact_note ONCE with that complete content. If you want to revise the brief after generating it, edit the text in your reasoning before issuing the tool_use, not by calling the tool a second time.
-- If a tool_result for create_contact_note shows the call succeeded, do NOT call it again. The note is persisted.
-
-ATOMIC PARALLEL WRITES (preferred): Issue all three as parallel tool_use blocks in a single assistant turn — three tool_use blocks in one response, one each for update_contact, update_business, and create_contact_note.
-
-NEVER end your turn (stop_reason=end_turn) until all three writes have been issued as tool_use calls. The synthesis text you generate is for your own reasoning trail — it does NOT replace calling create_contact_note. Writing the brief in your end_turn response is NOT sufficient; the brief must be the body argument of a create_contact_note tool_use call.
-
-Verification before ending: review the conversation history. Confirm you have issued tool_use blocks for ALL THREE of update_contact, update_business, AND create_contact_note — and only ONCE each. If any of the three is missing, do another tool_use turn to issue the missing call(s) before ending. If you find you accidentally issued create_contact_note twice in earlier turns, do not call it again — the note is already created (possibly twice); just end your turn.
-
-If a write fails (returns an error tool_result), set Enrichment Status to "Partially Enriched" via a follow-up update_contact call, but still attempt all three writes — never silently skip create_contact_note because of a non-fatal earlier error.
-
-IDEMPOTENCY GUARD: Your first action must be get_contact for the contact ID provided. Read the Enrichment Date and Enrichment Status custom fields from the response. If Enrichment Date EQUALS today's date (${today}) AND Enrichment Status is "Fully Enriched", stop immediately and return the exact text: "Skipped — contact was already enriched today." Do not call any other tools, do not perform any writes, do not re-run the pipeline. This guards against duplicate webhook fires within the same day. The 30-day freshness gate in the skill applies to manual user-driven enrichment; this same-day guard is the autonomous-webhook equivalent. Note: Enrichment Date is stored as a YYYY-MM-DD value with no time component, so an exact-match comparison is the appropriate precision here.
-
----
-
-${SKILL_CONTENT}`;
+async function ghlRequest(path, method = 'GET', body = null) {
+  const apiKey = process.env.GHL_API_KEY;
+  if (!apiKey) throw new Error('GHL_API_KEY not configured');
+  const res = await fetch(`${GHL_BASE_URL}${path}`, {
+    method,
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Version': GHL_API_VERSION,
+      'Content-Type': 'application/json',
+      'Accept': 'application/json'
+    },
+    body: body ? JSON.stringify(body) : undefined
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(`GHL ${method} ${path} ${res.status}: ${text.substring(0, 500)}`);
+  return text ? JSON.parse(text) : {};
 }
 
-// ─── Custom tool schemas (Apollo + Firecrawl as direct API tools) ──────────
-const CUSTOM_TOOLS = [
-  {
-    name: 'apollo_people_match',
-    description: 'Match a person on Apollo by name + email or domain. Returns title, seniority, LinkedIn URL, and embedded organization data. Cost: 1 Apollo credit.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        first_name: { type: 'string', description: 'First name (required)' },
-        last_name: { type: 'string', description: 'Last name (required)' },
-        email: { type: 'string', description: 'Email address (recommended for match accuracy)' },
-        domain: { type: 'string', description: 'Company domain (alternative to email)' },
-        organization_name: { type: 'string', description: 'Company name (fallback)' }
-      },
-      required: ['first_name', 'last_name']
-    }
-  },
-  {
-    name: 'apollo_organizations_enrich',
-    description: 'Enrich a company by domain on Apollo. Returns industry, employee count, annual revenue, founded year, address, description, website. Cost: 1 Apollo credit. Skip if person.organization from people_match already has the data.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        domain: { type: 'string', description: 'Company domain (e.g. acme.com) — required' }
-      },
-      required: ['domain']
-    }
-  },
-  {
-    name: 'firecrawl_scrape',
-    description: 'Scrape a webpage and return main content as markdown. Read the markdown yourself and extract intelligence — never trust auto-extraction. Use for company website analysis (services, geography, equipment mentions).',
-    input_schema: {
-      type: 'object',
-      properties: {
-        url: { type: 'string', description: 'Full URL to scrape' },
-        only_main_content: { type: 'boolean', description: 'Strip nav/ads/footer (default true)' }
-      },
-      required: ['url']
-    }
-  },
-  {
-    name: 'firecrawl_search',
-    description: 'Google search via Firecrawl. Returns ranked URLs and snippets. Use to find company websites (when domain is unknown), Sunbiz records, Google Maps listings, LinkedIn pages.',
-    input_schema: {
-      type: 'object',
-      properties: {
-        query: { type: 'string', description: 'Search query' },
-        limit: { type: 'number', description: 'Max results (default 5)' }
-      },
-      required: ['query']
-    }
-  }
-];
+async function ghlGetContact(contactId) {
+  return ghlRequest(`/contacts/${contactId}`);
+}
 
-// ─── Custom tool executors ─────────────────────────────────────────────────
+async function ghlGetBusiness(businessId) {
+  return ghlRequest(`/businesses/${businessId}`);
+}
+
+async function ghlUpdateContact(contactId, payload) {
+  return ghlRequest(`/contacts/${contactId}`, 'PUT', payload);
+}
+
+async function ghlUpdateBusiness(businessId, payload) {
+  return ghlRequest(`/businesses/${businessId}`, 'PUT', payload);
+}
+
+async function ghlCreateContactNote(contactId, body) {
+  return ghlRequest(`/contacts/${contactId}/notes`, 'POST', { body });
+}
+
+// Read a contact custom field value by canonical name.
+function readContactCustomField(contactResponse, fieldName) {
+  const fieldId = CONTACT_FIELDS[fieldName];
+  if (!fieldId) return undefined;
+  const cf = (contactResponse && contactResponse.contact && contactResponse.contact.customFields) || [];
+  const f = cf.find(x => x && x.id === fieldId);
+  if (!f) return undefined;
+  return f.value !== undefined ? f.value : f.field_value;
+}
+
+// Build the customFields array for an update_contact PUT body.
+// Input: { fieldName: value, ... } where fieldName is a key in CONTACT_FIELDS.
+// Empty/null/undefined values are skipped so we never null-out existing data.
+function buildContactCustomFieldsArray(values) {
+  const arr = [];
+  for (const [name, value] of Object.entries(values || {})) {
+    if (value === undefined || value === null || value === '') continue;
+    const id = CONTACT_FIELDS[name];
+    if (!id) continue;
+    arr.push({ id, field_value: String(value) });
+  }
+  return arr;
+}
+
+// ─── External research tool executors (Apollo, Firecrawl) ──────────────────
 
 async function execApolloPeopleMatch(input) {
   const body = { first_name: input.first_name, last_name: input.last_name };
   if (input.email) body.email = input.email;
   if (input.domain) body.domain = input.domain;
   if (input.organization_name) body.organization_name = input.organization_name;
-
   const res = await fetch('https://api.apollo.io/api/v1/people/match', {
     method: 'POST',
     headers: {
@@ -189,9 +174,6 @@ async function execFirecrawlScrape(input) {
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`Firecrawl scrape ${res.status}: ${text.substring(0, 500)}`);
-  // No size truncation — Vercel Pro Fluid Compute's 800s ceiling combined
-  // with adaptive 180s/300s per-turn timeouts gives Anthropic enough room
-  // to process full enterprise-site markdown.
   return JSON.parse(text);
 }
 
@@ -210,71 +192,405 @@ async function execFirecrawlSearch(input) {
   return JSON.parse(text);
 }
 
-async function executeCustomTool(name, input) {
+// Stage 1 read-only GHL custom tools — wraps direct HTTPS so the agent can
+// pull contact and business data without any MCP exposure (which would
+// expose write tools).
+async function execGetContactTool(input) {
+  return ghlGetContact(input.contactId);
+}
+
+async function execGetBusinessTool(input) {
+  return ghlGetBusiness(input.businessId);
+}
+
+async function executeStage1Tool(name, input) {
   const inputPreview = JSON.stringify(input).substring(0, 200);
-  console.log(`[enrich] tool_call: ${name} ${inputPreview}`);
+  console.log(`[research] tool_call: ${name} ${inputPreview}`);
   try {
     let result;
     switch (name) {
+      case 'get_contact': result = await execGetContactTool(input); break;
+      case 'get_business': result = await execGetBusinessTool(input); break;
       case 'apollo_people_match': result = await execApolloPeopleMatch(input); break;
       case 'apollo_organizations_enrich': result = await execApolloOrgEnrich(input); break;
       case 'firecrawl_scrape': result = await execFirecrawlScrape(input); break;
       case 'firecrawl_search': result = await execFirecrawlSearch(input); break;
-      default: throw new Error(`Unknown custom tool: ${name}`);
+      default: throw new Error(`Unknown Stage 1 tool: ${name}`);
     }
     return result;
   } catch (err) {
-    console.error(`[enrich] tool ${name} failed: ${err.message}`);
+    console.error(`[research] tool ${name} failed: ${err.message}`);
     return { error: err.message };
   }
 }
 
-// ─── Anthropic API call ────────────────────────────────────────────────────
+// ─── Tool schemas ──────────────────────────────────────────────────────────
 
-async function callAnthropic(messages, timeoutMs = PER_TURN_TIMEOUT_MS) {
-  const mcpUrl = `https://go-high-level-mcp-theta.vercel.app/${process.env.MCP_PATH_SECRET}/sse`;
+const STAGE1_TOOLS = [
+  {
+    name: 'get_contact',
+    description: 'Read a GHL contact by ID. Returns contact object including custom field values, email, phone, name, businessId, tags, and contact source.',
+    input_schema: {
+      type: 'object',
+      properties: { contactId: { type: 'string' } },
+      required: ['contactId']
+    }
+  },
+  {
+    name: 'get_business',
+    description: 'Read a GHL business by ID. Returns business object including standard fields (name, website, phone, address, description) and existing custom fields.',
+    input_schema: {
+      type: 'object',
+      properties: { businessId: { type: 'string' } },
+      required: ['businessId']
+    }
+  },
+  {
+    name: 'apollo_people_match',
+    description: 'Match a person on Apollo by name + email or domain. Returns title, seniority, LinkedIn URL, and embedded organization data. Cost: 1 Apollo credit.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        first_name: { type: 'string' },
+        last_name: { type: 'string' },
+        email: { type: 'string' },
+        domain: { type: 'string' },
+        organization_name: { type: 'string' }
+      },
+      required: ['first_name', 'last_name']
+    }
+  },
+  {
+    name: 'apollo_organizations_enrich',
+    description: 'Enrich a company by domain on Apollo. Returns industry, employee count, annual revenue, founded year, address, description, website. Cost: 1 Apollo credit. Skip if person.organization from people_match already has the data.',
+    input_schema: {
+      type: 'object',
+      properties: { domain: { type: 'string' } },
+      required: ['domain']
+    }
+  },
+  {
+    name: 'firecrawl_scrape',
+    description: 'Scrape a webpage and return main content as markdown. Read the markdown yourself and extract intelligence — never trust auto-extraction.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        url: { type: 'string' },
+        only_main_content: { type: 'boolean' }
+      },
+      required: ['url']
+    }
+  },
+  {
+    name: 'firecrawl_search',
+    description: 'Google search via Firecrawl. Returns ranked URLs and snippets. Use to find company websites, Sunbiz records, Google Maps listings, LinkedIn pages.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        query: { type: 'string' },
+        limit: { type: 'number' }
+      },
+      required: ['query']
+    }
+  },
+  {
+    name: 'emit_research_findings',
+    description: 'Stage 1 terminator. Call EXACTLY ONCE when research is complete to pass structured findings to Stage 2 (synthesis). Stage 2 will then classify, score, and produce the pre-call brief from this payload. Stop researching and emit when you have enough data to confidently classify and score at least 3 of the 6 ICP factors. If sources are exhausted without sufficient data, set sufficient=false and emit anyway — Stage 3 will produce a Failure brief.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        sufficient: { type: 'boolean', description: 'True if 3+ ICP factors can be scored confidently. False if all sources exhausted.' },
+        classification_intent: {
+          type: 'string',
+          enum: ['customer', 'partner', 'low_fit', 'failure'],
+          description: 'Best read of the classification per Phase 6 Step 1. Stage 2 may refine.'
+        },
+        contact_summary: {
+          type: 'object',
+          properties: {
+            first_name: { type: 'string' },
+            last_name: { type: 'string' },
+            email: { type: 'string' },
+            phone: { type: 'string' },
+            company_name: { type: 'string' },
+            discovered_domain: { type: 'string' },
+            known_lead_source: { type: 'string' },
+            business_id: { type: 'string', description: 'GHL businessId from the contact record (passes through to Stage 3 for update_business).' }
+          }
+        },
+        apollo_person: {
+          type: 'object',
+          description: 'Compact summary: title, seniority, linkedin_url, organization_name/website/industry/employees/revenue if embedded.',
+          properties: {
+            title: { type: 'string' },
+            seniority: { type: 'string' },
+            linkedin_url: { type: 'string' },
+            organization_name: { type: 'string' },
+            organization_website: { type: 'string' },
+            organization_industry: { type: 'string' },
+            organization_employees: { type: 'integer' },
+            organization_revenue: { type: 'number' },
+            organization_description: { type: 'string' },
+            organization_founded_year: { type: 'integer' }
+          }
+        },
+        apollo_organization: {
+          type: 'object',
+          description: 'Compact org enrich summary if separately fetched.',
+          properties: {
+            industry: { type: 'string' },
+            employees: { type: 'integer' },
+            annual_revenue: { type: 'number' },
+            founded_year: { type: 'integer' },
+            description: { type: 'string' },
+            website: { type: 'string' },
+            phone: { type: 'string' },
+            street: { type: 'string' },
+            city: { type: 'string' },
+            state: { type: 'string' },
+            postal_code: { type: 'string' },
+            country: { type: 'string' }
+          }
+        },
+        firecrawl_findings: {
+          type: 'object',
+          properties: {
+            services: { type: 'string', description: 'Services / specialties / project types found on the website.' },
+            service_areas: { type: 'string', description: 'Geographic regions / cities / counties served.' },
+            equipment_signals: { type: 'string', description: 'Mentions of GPS, drones, 3D scanning, etc. (TerraGenie fit signals).' },
+            customer_vs_vendor: { type: 'string', description: 'Whether the company looks like a direct customer prospect vs. tech vendor / supplier.' },
+            extracted_company_description: { type: 'string' },
+            notes: { type: 'string', description: 'Any other relevant observations.' }
+          }
+        },
+        fallback_findings: {
+          type: 'object',
+          description: 'Free-form notes from Sunbiz, Google Maps, LinkedIn search, etc. when Apollo + Firecrawl were insufficient.',
+          properties: {
+            sunbiz: { type: 'string' },
+            google_maps: { type: 'string' },
+            linkedin: { type: 'string' },
+            other: { type: 'string' }
+          }
+        },
+        sources_used: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Sources that returned usable data, e.g. ["Apollo Person", "Apollo Org", "Firecrawl", "Sunbiz", "Google Maps", "LinkedIn"]. Stage 2 appends "AI Synthesis" automatically.'
+        },
+        data_gaps: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Specific factors that could not be scored, e.g. "geography unknown", "no decision-maker title", "no revenue".'
+        },
+        name_correction_candidates: {
+          type: 'object',
+          properties: {
+            first_name: { type: 'string' },
+            last_name: { type: 'string' },
+            company_name: { type: 'string' },
+            confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+            note: { type: 'string' }
+          }
+        },
+        research_summary: {
+          type: 'string',
+          description: '2-4 paragraph free-form synthesis of what was found. Stage 2 reads this when generating brief sections.'
+        }
+      },
+      required: ['sufficient', 'classification_intent', 'contact_summary', 'sources_used', 'research_summary']
+    }
+  }
+];
 
+const EMIT_ENRICHMENT_TOOL = {
+  name: 'emit_enrichment',
+  description: 'Stage 2 terminator and ONLY valid output. Call exactly once with the complete enrichment object. Stage 3 will write contact custom fields, business standard fields, and the pre-call brief note from this payload deterministically.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      classification: { type: 'string', enum: ['customer', 'partner', 'low_fit', 'failure'] },
+      icp_score: { type: 'integer', minimum: 0, maximum: 100 },
+      confidence_level: { type: 'string', enum: ['High', 'Medium', 'Low', 'Very Low'] },
+      icp_segment: {
+        type: 'string',
+        description: 'Per Phase 6 Step 4. Use the dash form exactly as defined in the skill (e.g. "Primary - Civil/Construction", "Partner - Technology Vendor", "Low Fit - Property Management").'
+      },
+      engagement_signal: { type: 'string', description: 'One-liner per Phase 6 Step 5.' },
+      icp_scoring_breakdown: {
+        type: 'string',
+        description: 'Factor-by-factor breakdown text. Example: "Industry 35/35 (Construction); Geography 22/25 (FL projects); Decision Maker 15/15 (CEO); Company Size 12/15 (Small 11-50); Revenue 0/5 (Unknown); Digital Presence 5/5 (Full website)". Used by Stage 3 in the brief.'
+      },
+      name_corrections: {
+        type: 'object',
+        description: 'Only include fields where there is medium-or-high confidence the GHL value is wrong. Stage 3 overwrites these via update_contact / update_business. Always apply Title Case fixes for all-lower or ALL-CAPS names.',
+        properties: {
+          first_name: { type: 'string' },
+          last_name: { type: 'string' },
+          company_name: { type: 'string' }
+        }
+      },
+      contact_fields: {
+        type: 'object',
+        description: 'Values for the 16 contact custom fields. Use empty string to skip a field (Stage 3 will not write it). enrichment_date is set by Stage 3 (do not include).',
+        properties: {
+          company_position: { type: 'string' },
+          linkedin_url: { type: 'string' },
+          industry: { type: 'string', enum: ['Construction', 'Surveyors', 'Infrastructure Detectors', 'Landscape or Playgrounds', 'Pools', 'Other', ''] },
+          decision_maker: { type: 'string', enum: ['Yes', 'No', 'Unknown', 'Gatekeeper', ''] },
+          verified_email: { type: 'string' },
+          contact_source: { type: 'string', description: 'Only set if currently empty in GHL. Stage 3 enforces preservation.' },
+          company_size_tier: { type: 'string' },
+          revenue_tier: { type: 'string' },
+          service_area: { type: 'string' },
+          year_founded: { type: 'integer' },
+          company_website: { type: 'string' },
+          enrichment_source: { type: 'string', description: 'Pipe-delimited list of sources that returned data. Stage 3 appends " | AI Synthesis" automatically.' },
+          enrichment_status: { type: 'string', enum: ['Fully Enriched', 'Partially Enriched', 'Enrichment Failed'] }
+        }
+      },
+      business_fields: {
+        type: 'object',
+        description: 'Standard business fields. Only include fields you want Stage 3 to write. Empty / absent fields are skipped so existing GHL data is preserved.',
+        properties: {
+          name: { type: 'string' },
+          website: { type: 'string' },
+          phone: { type: 'string' },
+          email: { type: 'string' },
+          address: { type: 'string' },
+          city: { type: 'string' },
+          state: { type: 'string' },
+          postal_code: { type: 'string' },
+          country: { type: 'string' },
+          description: { type: 'string' }
+        }
+      },
+      brief: {
+        type: 'object',
+        description: 'Pre-call brief sections. Stage 3 selects the template by classification and assembles. Populate the sections that apply to this classification (see Phase 6 brief templates in the skill). opening_angles is MANDATORY for every classification.',
+        properties: {
+          header_flag: { type: 'string', description: 'Customer only, optional. Use plain text like "TOP PRIORITY LEAD" when ICP score is 90+, or a warning marker when there is a data discrepancy. Stage 3 prepends visual decoration.' },
+          who: { type: 'string', description: 'WHO HE/SHE IS (customer, low_fit) or WHO THEY ARE (partner) — 2-4 sentence narrative.' },
+          company: { type: 'string', description: 'THE COMPANY — 2-4 sentence narrative. Used for customer and low_fit; optional for partner.' },
+          lead_source: { type: 'string', description: 'LEAD SOURCE line. Format example: "Source: Web Form - Demo Request - submitted at IBS expo, indicates active interest". Used for customer and low_fit.' },
+          customer_why_fits: { type: 'string', description: 'WHY TerraGenie FITS — customer only. 2-3 sentences specific to this company.' },
+          customer_deal_size: { type: 'string', description: 'POTENTIAL DEAL SIZE — customer only, optional.' },
+          partner_partnership_potential: { type: 'string', description: 'PARTNERSHIP POTENTIAL — partner only.' },
+          partner_referral_angle: { type: 'string', description: 'REFERRAL/INTEGRATION ANGLE — partner only.' },
+          partner_considerations: { type: 'string', description: 'CONSIDERATIONS — partner only, optional.' },
+          low_fit_icp_notes: { type: 'string', description: 'ICP NOTES — low_fit only. Factual, neutral. No "do not pursue" language.' },
+          low_fit_possible_angles: { type: 'string', description: 'POSSIBLE ANGLES — low_fit only.' },
+          failure_what_we_know: { type: 'string', description: 'WHAT WE KNOW — failure only.' },
+          failure_what_we_tried: { type: 'string', description: 'WHAT WE TRIED — failure only.' },
+          failure_next_steps: { type: 'string', description: 'RECOMMENDED NEXT STEPS — failure only.' },
+          opening_angles: {
+            type: 'array',
+            items: { type: 'string' },
+            minItems: 2,
+            description: 'MANDATORY for every classification. 2-3 ready-to-use opening lines. When data is thin, anchor on lead source / form responses / geography / company name and explicitly note the limitation.'
+          },
+          contact_info: { type: 'string', description: 'Pre-formatted multi-line block with available email, phone, LinkedIn, etc.' }
+        },
+        required: ['who', 'opening_angles']
+      }
+    },
+    required: ['classification', 'icp_score', 'confidence_level', 'icp_segment', 'contact_fields', 'brief']
+  }
+};
+
+// ─── System prompts (date-injected, skill-content-embedded) ────────────────
+
+function buildResearchSystemPrompt() {
+  const today = new Date().toISOString().slice(0, 10);
+  return `You are running Stage 1 (Research) of an automated lead-enrichment pipeline triggered by a GoHighLevel webhook. You are RESEARCH ONLY. You do NOT write to GHL. A separate stage handles all writeback.
+
+CURRENT DATE: ${today} (today, YYYY-MM-DD, UTC).
+
+Your job: gather and verify information about this lead so the synthesis stage can produce a high-quality pre-call brief. Run Phases 1 through 5 of the skill below (Input/Identification, Domain Discovery, Apollo Person, Apollo Org, Firecrawl Website with optional sub-page scrapes, plus the multi-source fallback chain when Apollo org is empty). Apply the classification gate guidance from Phase 6 Step 1 only enough to decide which kind of brief should be generated downstream — set classification_intent in your emit payload accordingly. Do NOT compute the final ICP score or write the brief text; Stage 2 owns those.
+
+Tools available in THIS stage:
+- get_contact, get_business — read-only GHL data via direct HTTPS
+- apollo_people_match, apollo_organizations_enrich — Apollo person and company enrichment
+- firecrawl_scrape, firecrawl_search — website scraping and Google search
+- emit_research_findings — TERMINATOR. Call exactly once when research is complete with the structured findings payload.
+
+Tools NOT available:
+- update_contact, update_business, create_contact_note — owned by Stage 3 writeback. They are not registered for this stage; do not attempt to call them.
+- Fullenrich tools — Stage 1 does not run Fullenrich. The skill default of OFF applies absolutely here.
+
+When you have enough data to confidently classify the lead AND score at least 3 of the 6 ICP factors, call emit_research_findings with the structured payload. Be thorough but bounded — once you have enough, stop researching and emit. Adaptive multi-source fallback is preserved: if Apollo org is empty or Firecrawl yields thin data, run the Phase 4b fallback chain (Sunbiz, Google Maps, LinkedIn) before emitting. Conditional sub-page scrapes (/about, /services, /our-work) are encouraged when the homepage is thin.
+
+If you exhaust all sources and still cannot score 3 factors, set sufficient=false in the emit_research_findings payload and emit anyway. Stage 3 will produce a Failure brief.
+
+After emit_research_findings returns successfully, end your turn. Do not call any other tools.
+
+---
+
+${SKILL_CONTENT}`;
+}
+
+function buildSynthesisSystemPrompt() {
+  return `You are running Stage 2 (Synthesis) of an automated lead-enrichment pipeline. Your input is a structured research payload from Stage 1. Your output is exactly ONE call to emit_enrichment with a complete structured enrichment object. You do NOT write to GHL — Stage 3 (function code) handles all writeback deterministically based on what you emit.
+
+Steps to perform, in order:
+1. Classify the lead per Phase 6 Step 1: customer, partner, low_fit, or failure. Use Stage 1's classification_intent as a starting point but refine if the data warrants it.
+2. Compute the ICP score (0-100) and confidence level using the rubric in Phase 6 Steps 2 and 3. Apply the gatekeeper modifier and the geography "project footprint, not HQ" rule.
+3. Determine the ICP segment per Phase 6 Step 4 (e.g., "Primary - Civil/Construction", "Partner - Technology Vendor", "Low Fit - Property Management").
+4. Populate icp_scoring_breakdown with a one-line per-factor breakdown for the brief.
+5. Compute the 16 contact custom field values per the field mappings in Phase 6. Leave a field as empty string ("") if you cannot determine its value — Stage 3 will skip empties so existing GHL data is preserved. enrichment_date is set automatically by Stage 3; do not include it.
+6. Compute business standard field values from discovered website / address / phone / description. Only include fields you confidently want to write. Stage 3 skips empties.
+7. If the research provided name_correction_candidates with medium-or-high confidence, populate name_corrections. Always apply Title Case fixes for all-lower or ALL-CAPS names.
+8. Generate the pre-call brief sections matching the classification:
+   - customer: who, company, lead_source, customer_why_fits, opening_angles[2-3], optional customer_deal_size, contact_info, optional header_flag
+   - partner: who, partner_partnership_potential, partner_referral_angle, optional partner_considerations, opening_angles[2-3], contact_info, optionally company
+   - low_fit: who, company, lead_source, low_fit_icp_notes, low_fit_possible_angles, opening_angles[2-3], contact_info
+   - failure: failure_what_we_know, failure_what_we_tried, failure_next_steps, opening_angles[2-3], who is optional
+
+OPENING_ANGLES is MANDATORY for every classification — never empty. Provide 2-3 numbered, ready-to-use opening lines. When data is thin (low confidence, sparse research), anchor openers on lead source, form responses, geography, or company name and explicitly note the limitation inside the array text.
+
+Section content is plain prose. Do not include emoji headers, "WHO HE/SHE IS:" prefixes, or section labels. Stage 3 wraps content with the appropriate template scaffolding based on classification.
+
+WRITING STYLE: do not use em dashes (—) or en dashes (–) anywhere in section content. Use commas, periods, parentheses, or restructure the sentence. Hyphens (-) are fine for compound modifiers like "design-build" or "ground-up". This applies to every brief section including opening_angles, icp_scoring_breakdown, and contact_info.
+
+Do not call any other tools. emit_enrichment is your only valid output. Call it exactly once.
+
+---
+
+${SKILL_CONTENT}`;
+}
+
+// ─── Anthropic call with retry ─────────────────────────────────────────────
+
+async function callAnthropic({ model = MODEL, maxTokens, system, messages, tools, toolChoice, betaHeaders, timeoutMs }) {
   const body = {
-    model: MODEL,
-    max_tokens: MAX_TOKENS_PER_TURN,
-    system: [
-      { type: 'text', text: buildSystemPrompt(), cache_control: { type: 'ephemeral' } }
-    ],
-    messages,
-    // The mcp-client-2025-11-20 beta requires an explicit mcp_toolset entry in
-    // tools to bind the model to a declared MCP server. Without it, the API
-    // returns "MCP server 'ghl' is defined but [not used]".
-    tools: [
-      ...CUSTOM_TOOLS,
-      { type: 'mcp_toolset', mcp_server_name: 'ghl' }
-    ],
-    mcp_servers: [
-      { type: 'url', url: mcpUrl, name: 'ghl' }
-    ]
+    model,
+    max_tokens: maxTokens,
+    system: [{ type: 'text', text: system, cache_control: { type: 'ephemeral' } }],
+    messages
   };
+  if (tools) body.tools = tools;
+  if (toolChoice) body.tool_choice = toolChoice;
 
-  console.log(`[anthropic] POST ${ANTHROPIC_API_URL} body=${JSON.stringify(body).length}b timeout=${timeoutMs / 1000}s`);
+  console.log(`[anthropic] POST body=${JSON.stringify(body).length}b model=${model} tools=${tools ? tools.length : 0} timeout=${timeoutMs / 1000}s`);
 
-  // Per-turn fetch timeout. The wrapper passes a longer value on retries, since
-  // the retry-after-timeout case usually means Anthropic legitimately needs
-  // more time to process the body (which is identical between attempts), and
-  // the same 90s window will fail the same way.
   const controller = new AbortController();
   const timeoutId = setTimeout(() => {
     console.warn(`[anthropic] aborting fetch after ${timeoutMs / 1000}s`);
     controller.abort();
   }, timeoutMs);
 
+  const headers = {
+    'x-api-key': process.env.ANTHROPIC_API_KEY,
+    'anthropic-version': '2023-06-01',
+    'content-type': 'application/json'
+  };
+  if (betaHeaders) headers['anthropic-beta'] = betaHeaders;
+
   let res;
   try {
     res = await fetch(ANTHROPIC_API_URL, {
       method: 'POST',
-      headers: {
-        'x-api-key': process.env.ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
-        'anthropic-beta': ANTHROPIC_BETA,
-        'content-type': 'application/json'
-      },
+      headers,
       body: JSON.stringify(body),
       signal: controller.signal
     });
@@ -285,50 +601,34 @@ async function callAnthropic(messages, timeoutMs = PER_TURN_TIMEOUT_MS) {
   }
   clearTimeout(timeoutId);
 
-  console.log(`[anthropic] response status=${res.status}`);
-
   const text = await res.text();
-  console.log(`[anthropic] response body=${text.length}b status=${res.status}`);
-
+  console.log(`[anthropic] response status=${res.status} body=${text.length}b`);
   if (!res.ok) {
     console.error(`[anthropic] error body: ${text.substring(0, 2000)}`);
     throw new Error(`Anthropic API ${res.status}: ${text.substring(0, 1000)}`);
   }
-
   try {
     return JSON.parse(text);
   } catch (err) {
-    console.error(`[anthropic] JSON parse failed: ${err.message}; body preview: ${text.substring(0, 500)}`);
+    console.error(`[anthropic] JSON parse failed: ${err.message}; preview: ${text.substring(0, 500)}`);
     throw err;
   }
 }
 
-// ─── Anthropic retry wrapper ───────────────────────────────────────────────
-// Wraps callAnthropic with a small retry-on-transient-error budget. Retries
-// on 429, common 5xx, Anthropic 529 (overloaded), MCP-server connection
-// errors (which surface as 400s with a specific message), AbortError, and
-// network-level failures. Backoff is short (1s, 3s) so a degenerate case
-// adds at most ~4s per turn. Hard failures (400 bad request, 401 auth, etc.)
-// still throw immediately — they will not be cured by retry.
-
-async function callAnthropicWithRetry(messages, maxAttempts = 2) {
-  // Adaptive per-attempt timeout. Heavy turns (large accumulated context
-  // plus content-rich tool results) genuinely need extra time to process.
-  // First attempt 180s; retry 300s. Worst case per stuck turn = 180 + 1
-  // backoff + 300 = 481s, leaves headroom under the 750s deadline guard
-  // on Vercel Pro Fluid Compute (800s function ceiling).
-  const timeoutSchedule = [PER_TURN_TIMEOUT_MS, 300 * 1000];
+async function callAnthropicWithRetry(args, maxAttempts = 2) {
+  const baseTimeout = args.timeoutMs || PER_TURN_TIMEOUT_MS;
+  const timeoutSchedule = [baseTimeout, Math.min(300 * 1000, Math.round(baseTimeout * 1.7))];
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const attemptTimeout = timeoutSchedule[attempt - 1] || timeoutSchedule[timeoutSchedule.length - 1];
     try {
-      return await callAnthropic(messages, attemptTimeout);
+      return await callAnthropic({ ...args, timeoutMs: attemptTimeout });
     } catch (err) {
       lastErr = err;
       const msg = (err && err.message) || '';
       const isTransient =
         /\b(429|500|502|503|504|529)\b/.test(msg) ||
-        /MCP server|Connection error/i.test(msg) ||
+        /Connection error|overloaded/i.test(msg) ||
         /ECONNRESET|ETIMEDOUT|fetch failed|socket hang up|aborted/i.test(msg) ||
         err.name === 'AbortError';
       if (!isTransient || attempt === maxAttempts) {
@@ -338,39 +638,30 @@ async function callAnthropicWithRetry(messages, maxAttempts = 2) {
         throw err;
       }
       const backoffMs = attempt === 1 ? 1000 : 3000;
-      console.warn(`[anthropic] transient failure attempt=${attempt}/${maxAttempts} reason="${msg.substring(0, 200)}" retrying in ${backoffMs}ms (next timeout=${(timeoutSchedule[attempt] || timeoutSchedule[timeoutSchedule.length - 1]) / 1000}s)`);
+      console.warn(`[anthropic] transient failure attempt=${attempt}/${maxAttempts} reason="${msg.substring(0, 200)}" retrying in ${backoffMs}ms`);
       await new Promise((r) => setTimeout(r, backoffMs));
     }
   }
   throw lastErr;
 }
 
-// ─── Failure notification helper ───────────────────────────────────────────
-// Optional — only fires if NOTIFY_WEBHOOK_URL is set. Built to be universal:
-// the payload includes a `text` field (Slack mrkdwn-formatted, the only field
-// Slack Incoming Webhooks actually need) plus structured fields for any
-// other consumer (n8n, Zapier, GHL workflow webhook, ntfy.sh, etc.) — those
-// just read the structured keys and ignore `text`. Slack reads `text` and
-// ignores the structured keys. Universal payload.
-//
-// Best-effort: notification failures are swallowed so they never mask the
-// underlying enrichment failure.
+// ─── Failure notification (Slack-friendly universal payload) ───────────────
 
-function buildNotificationPayload({ source, contactId, reason, turns, timestamp }) {
+function buildNotificationPayload({ source, contactId, reason, stage, turns, timestamp }) {
   const ghlLoc = process.env.GHL_LOCATION_ID;
   const contactUrl = ghlLoc
     ? `https://app.gohighlevel.com/v2/location/${ghlLoc}/contacts/detail/${contactId}`
     : null;
   const logsUrl = 'https://vercel.com/robvaniglia-gmailcoms-projects/go-high-level-mcp/logs';
 
-  // Slack mrkdwn (single asterisks for bold, <URL|text> for links).
   const lines = [
     '*Lead enrichment failed*',
     `*Contact:* \`${contactId}\``,
+    `*Stage:* ${stage}`,
     `*Reason:* ${reason}`,
     `*Source:* ${source}`
   ];
-  if (turns != null) lines.push(`*Turns completed:* ${turns}`);
+  if (turns != null) lines.push(`*Research turns:* ${turns}`);
   lines.push(`*Time:* ${timestamp}`);
   const linkParts = [];
   if (contactUrl) linkParts.push(`<${contactUrl}|View contact in GHL>`);
@@ -381,6 +672,7 @@ function buildNotificationPayload({ source, contactId, reason, turns, timestamp 
     text: lines.join('\n'),
     event: 'lead_enrichment_failed',
     source,
+    stage,
     contact_id: contactId,
     reason,
     turns,
@@ -394,12 +686,11 @@ function buildNotificationPayload({ source, contactId, reason, turns, timestamp 
 async function postFailureNotification(args) {
   const url = process.env.NOTIFY_WEBHOOK_URL;
   if (!url) return;
-  const payload = buildNotificationPayload(args);
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(buildNotificationPayload(args))
     });
     console.log(`[enrich-webhook] notification posted status=${res.status}`);
   } catch (err) {
@@ -407,223 +698,605 @@ async function postFailureNotification(args) {
   }
 }
 
-// ─── Post-agent verification ───────────────────────────────────────────────
-// Polls GHL /contacts/{id}/notes to confirm the Pre-Call Brief landed.
-// Uses retry-with-backoff because GHL's API has read-after-write propagation
-// lag — a server-side MCP write that completed on Anthropic's side may not
-// be visible to a GHL read for ~500-3000ms. Without this retry, we'd
-// false-negative and trigger recovery loops that create duplicate notes.
-//
-// Returns: true (recent note exists, possibly after a retry), false (no
-// recent note found after all attempts), null (API itself errored —
-// treat as unknown).
-async function verifyBriefCreated(contactId, agentStartedAt) {
-  const apiKey = process.env.GHL_API_KEY;
-  if (!apiKey) return null;
-  const baseUrl = process.env.GHL_BASE_URL || 'https://services.leadconnectorhq.com';
-  const cutoff = agentStartedAt - 60 * 1000; // 60s grace window for clock skew
+// ─── Stage 1: Research loop ────────────────────────────────────────────────
 
-  // Up to 4 attempts with backoff. Total wait if all miss: 0 + 1 + 2 + 3 = 6s.
-  const backoffsMs = [0, 1000, 2000, 3000];
-  let lastApiError = false;
-  for (let attempt = 0; attempt < backoffsMs.length; attempt++) {
-    if (backoffsMs[attempt] > 0) {
-      await new Promise((r) => setTimeout(r, backoffsMs[attempt]));
-    }
-    try {
-      const res = await fetch(`${baseUrl}/contacts/${contactId}/notes`, {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Version': '2021-07-28',
-          'Accept': 'application/json'
-        }
-      });
-      if (!res.ok) {
-        console.warn(`[verify] attempt=${attempt + 1} notes lookup ${res.status} for ${contactId}`);
-        lastApiError = true;
-        continue;
-      }
-      lastApiError = false;
-      const data = await res.json();
-      const notes = (data && data.notes) || [];
-      const recent = notes.find((n) => {
-        const ts = new Date(n.dateAdded).getTime();
-        return Number.isFinite(ts) && ts >= cutoff;
-      });
-      if (recent) {
-        if (attempt > 0) {
-          console.log(`[verify] brief found on attempt ${attempt + 1} (after backoff for GHL propagation)`);
-        }
-        return true;
-      }
-      // No recent note yet — fall through to next attempt
-    } catch (err) {
-      console.error(`[verify] attempt=${attempt + 1} error: ${err.message}`);
-      lastApiError = true;
-    }
-  }
-  // Exhausted all attempts. If the last attempt was an API error, we don't
-  // really know — return null. If it was a clean lookup with no recent
-  // note, return false.
-  return lastApiError ? null : false;
-}
-
-// ─── Agent loop ────────────────────────────────────────────────────────────
-
-// Maximum follow-up prompts after end_turn if the Pre-Call Brief note wasn't
-// created. Each recovery prompt asks the agent to call create_contact_note.
-// Cap is small because if 2 explicit follow-ups don't get the agent to issue
-// the call, something deeper is wrong and we should fail loudly.
-const BRIEF_RECOVERY_MAX = 2;
-
-async function runEnrichment(contactId) {
+async function runResearchLoop(contactId, deadline) {
   const startTime = Date.now();
-  console.log(`[enrich] start contact=${contactId}`);
+  console.log(`[research] start contact=${contactId}`);
 
-  let messages = [
+  const messages = [
     {
       role: 'user',
-      content: `Enrich GHL contact ${contactId}. Run the full pipeline (read contact + business, Apollo person + org enrichment, Firecrawl website scrape, ICP scoring, GHL writeback for contact custom fields + business standard fields + pre-call brief note). Return a one-paragraph summary when done.`
+      content: `Research GHL contact ${contactId}. Run Phases 1-5 of the lead-enrichment skill. Begin with get_contact to load the contact record (look at the businessId so you can call get_business if there is one). Then run Apollo person, Apollo org (or skip if person.organization is rich enough), Firecrawl website intelligence, and the Phase 4b multi-source fallback chain if needed. When research is complete, call emit_research_findings with the structured payload. Do not write to GHL — Stage 3 handles all writes.`
     }
   ];
 
+  const systemPrompt = buildResearchSystemPrompt();
   let turn = 0;
-  let briefRecoveryAttempts = 0;
-  while (turn < MAX_TURNS) {
-    // Deadline guard: bail before Vercel hard-kills the function so the
-    // failure notification fires cleanly. Without this check, a function
-    // that runs past maxDuration (300s) is killed with no chance to run
-    // the .catch handler in waitUntil, and no Slack alert is sent.
+  let emittedFindings = null;
+  let lastAssistantText = '';
+
+  while (turn < MAX_RESEARCH_TURNS) {
     const elapsed = Date.now() - startTime;
-    if (elapsed > ENRICHMENT_DEADLINE_MS) {
-      console.warn(`[enrich] deadline exceeded at ${(elapsed / 1000).toFixed(1)}s — bailing`);
+    if (elapsed > deadline) {
+      console.warn(`[research] deadline exceeded at ${(elapsed / 1000).toFixed(1)}s, ${turn} turns`);
       return {
         ok: false,
         turns: turn,
-        elapsedSeconds: (elapsed / 1000).toFixed(1),
-        error: `deadline_exceeded after ${turn} turns and ${(elapsed / 1000).toFixed(1)}s (Vercel maxDuration is 300s; budget is ${ENRICHMENT_DEADLINE_MS / 1000}s)`
+        error: `research_deadline_exceeded after ${(elapsed / 1000).toFixed(1)}s`,
+        partialAssistantText: lastAssistantText
       };
     }
     turn++;
-    console.log(`[enrich] turn=${turn} calling Anthropic (elapsed=${(elapsed / 1000).toFixed(1)}s)`);
 
-    const response = await callAnthropicWithRetry(messages);
+    const response = await callAnthropicWithRetry({
+      maxTokens: MAX_TOKENS_RESEARCH,
+      system: systemPrompt,
+      messages,
+      tools: STAGE1_TOOLS,
+      timeoutMs: PER_TURN_TIMEOUT_MS
+    });
+
     const usage = response.usage || {};
-    console.log(`[enrich] turn=${turn} stop=${response.stop_reason} ` +
+    console.log(`[research] turn=${turn} stop=${response.stop_reason} ` +
                 `in=${usage.input_tokens || 0} cache_read=${usage.cache_read_input_tokens || 0} ` +
-                `cache_create=${usage.cache_creation_input_tokens || 0} out=${usage.output_tokens || 0}`);
+                `out=${usage.output_tokens || 0}`);
 
-    const assistantContent = response.content;
+    const assistantContent = response.content || [];
+    const textBlocks = assistantContent.filter(b => b.type === 'text').map(b => b.text);
+    if (textBlocks.length) lastAssistantText = textBlocks.join('\n').substring(0, 4000);
 
     if (response.stop_reason === 'tool_use') {
-      const toolUseBlocks = assistantContent.filter(b => b.type === 'tool_use');
-      const customToolUses = toolUseBlocks.filter(b => CUSTOM_TOOLS.some(t => t.name === b.name));
+      const toolUses = assistantContent.filter(b => b.type === 'tool_use');
+      const emitBlock = toolUses.find(b => b.name === 'emit_research_findings');
 
-      if (customToolUses.length === 0) {
-        // Anthropic resolves MCP tool calls server-side, so we shouldn't see them here.
-        // If we do see tool_use with no custom tools, something's off.
-        console.warn(`[enrich] turn=${turn} stop=tool_use but no custom tools to execute`);
-        break;
+      if (emitBlock) {
+        emittedFindings = emitBlock.input || {};
+        console.log(`[research] emit_research_findings received (sufficient=${emittedFindings.sufficient}, intent=${emittedFindings.classification_intent}, sources=${(emittedFindings.sources_used || []).join(',')})`);
+        // Acknowledge the emit so the agent terminates cleanly. We don't
+        // need to actually loop again — emit means done.
+        return {
+          ok: true,
+          turns: turn,
+          findings: emittedFindings,
+          elapsedSeconds: ((Date.now() - startTime) / 1000).toFixed(1)
+        };
       }
 
       const toolResults = [];
-      for (const block of customToolUses) {
-        const result = await executeCustomTool(block.name, block.input);
+      for (const block of toolUses) {
+        const result = await executeStage1Tool(block.name, block.input);
         toolResults.push({
           type: 'tool_result',
           tool_use_id: block.id,
           content: typeof result === 'string' ? result : JSON.stringify(result)
         });
       }
-
       messages.push({ role: 'assistant', content: assistantContent });
       messages.push({ role: 'user', content: toolResults });
     } else if (response.stop_reason === 'end_turn') {
-      const finalText = assistantContent
-        .filter(b => b.type === 'text')
-        .map(b => b.text)
-        .join('\n');
-      const elapsedFmt = ((Date.now() - startTime) / 1000).toFixed(1);
-
-      // Brief verification + recovery loop. The agent occasionally ends its
-      // turn after writing the synthesis text without issuing
-      // create_contact_note as a tool_use call. We hit the GHL API to check
-      // for a recently-created note. If missing and we still have recovery
-      // budget, push a follow-up message asking the agent to call
-      // create_contact_note now and continue the loop. After the recovery
-      // cap is exhausted, return ok:false so the failure path fires a
-      // Slack alert.
-      const briefExists = await verifyBriefCreated(contactId, startTime);
-
-      if (briefExists === true) {
-        console.log(`[enrich] DONE in ${elapsedFmt}s, ${turn} turns (brief verified). Summary: ${finalText.substring(0, 1500)}`);
-        return { ok: true, turns: turn, elapsedSeconds: elapsedFmt, finalText, briefVerified: true };
-      }
-
-      if (briefExists === null) {
-        // Verification couldn't run (no API key, network, etc). Don't block
-        // on it — return success and let the .then handler log it as
-        // "(brief unverified)".
-        console.log(`[enrich] DONE in ${elapsedFmt}s, ${turn} turns (brief unverified — verification skipped). Summary: ${finalText.substring(0, 1500)}`);
-        return { ok: true, turns: turn, elapsedSeconds: elapsedFmt, finalText, briefVerified: null };
-      }
-
-      // briefExists === false: agent ended without creating the note.
-      if (briefRecoveryAttempts < BRIEF_RECOVERY_MAX) {
-        briefRecoveryAttempts++;
-        console.warn(`[enrich] end_turn at ${elapsedFmt}s but no Pre-Call Brief note found in GHL — recovery attempt ${briefRecoveryAttempts}/${BRIEF_RECOVERY_MAX}`);
-        messages.push({ role: 'assistant', content: assistantContent });
-        messages.push({
-          role: 'user',
-          content: `Phase 7 verification: I just queried GHL via the contacts/${contactId}/notes API and confirmed that create_contact_note was NOT issued during this run. The other writes (update_contact, update_business) appear to have completed, but the Pre-Call Brief note has not been persisted.\n\nThe Pre-Call Brief is the most valuable artifact for the sales team — it cannot be skipped. Issue create_contact_note RIGHT NOW as a tool_use call, with the body argument set to the full Pre-Call Brief in the format defined by the skill for this contact's classification (Customer / Partner / Low-Fit / Failure). Do not summarize or paraphrase — write the complete brief with all required sections including OPENING ANGLES.\n\nAfter create_contact_note returns successfully, you may end your turn. Do not call any other tools.`
-        });
-        continue; // re-enter the while loop, agent gets another chance
-      }
-
-      // Recovery exhausted. Return failure so .then triggers a Slack alert.
-      console.error(`[enrich] DONE in ${elapsedFmt}s, ${turn} turns — brief still missing after ${BRIEF_RECOVERY_MAX} recovery attempts`);
+      console.warn(`[research] end_turn at turn=${turn} without emit_research_findings`);
       return {
         ok: false,
         turns: turn,
-        elapsedSeconds: elapsedFmt,
-        finalText,
-        error: `brief_missing_after_${BRIEF_RECOVERY_MAX}_recovery_attempts: agent ended cleanly but never issued create_contact_note despite explicit follow-up prompts`
+        error: 'research_ended_without_emit',
+        partialAssistantText: lastAssistantText,
+        elapsedSeconds: ((Date.now() - startTime) / 1000).toFixed(1)
       };
     } else {
-      console.warn(`[enrich] unexpected stop_reason: ${response.stop_reason}`);
-      break;
+      console.warn(`[research] unexpected stop_reason: ${response.stop_reason}`);
+      return {
+        ok: false,
+        turns: turn,
+        error: `unexpected_stop_reason: ${response.stop_reason}`,
+        partialAssistantText: lastAssistantText
+      };
     }
   }
 
-  console.warn(`[enrich] hit MAX_TURNS=${MAX_TURNS}`);
-  return { ok: false, turns: turn, error: 'max_turns_exceeded' };
+  console.warn(`[research] hit MAX_RESEARCH_TURNS=${MAX_RESEARCH_TURNS}`);
+  return {
+    ok: false,
+    turns: turn,
+    error: 'max_research_turns_exceeded',
+    partialAssistantText: lastAssistantText
+  };
+}
+
+// ─── Stage 2: Synthesis ────────────────────────────────────────────────────
+
+async function synthesizeEnrichment({ findings, contactId, contactRecord, businessRecord }) {
+  console.log(`[synthesis] start contact=${contactId}`);
+  const startTime = Date.now();
+
+  // Compact contact + business snapshot to give the synthesis stage just
+  // enough source-of-truth state without bloating context. The skill's
+  // classification rules and rubric come from SKILL_CONTENT in the system
+  // prompt; this user message is just the inputs.
+  const contact = (contactRecord && contactRecord.contact) || contactRecord || {};
+  const business = (businessRecord && businessRecord.business) || businessRecord || null;
+  const contactSnapshot = {
+    id: contact.id || contactId,
+    firstName: contact.firstName,
+    lastName: contact.lastName,
+    email: contact.email,
+    phone: contact.phone,
+    companyName: contact.companyName,
+    businessId: contact.businessId,
+    contactSource: contact.source,
+    tags: contact.tags
+  };
+  const businessSnapshot = business
+    ? {
+        id: business.id,
+        name: business.name,
+        website: business.website,
+        phone: business.phone,
+        email: business.email,
+        address: business.address,
+        city: business.city,
+        state: business.state,
+        postalCode: business.postalCode,
+        country: business.country,
+        description: business.description
+      }
+    : null;
+
+  const userMessage = [
+    'Here is the structured research payload from Stage 1, plus the current GHL contact and business records. Synthesize the complete enrichment per the skill rules and emit via emit_enrichment.',
+    '',
+    '<research_findings>',
+    JSON.stringify(findings, null, 2),
+    '</research_findings>',
+    '',
+    '<ghl_contact>',
+    JSON.stringify(contactSnapshot, null, 2),
+    '</ghl_contact>',
+    businessSnapshot ? `<ghl_business>\n${JSON.stringify(businessSnapshot, null, 2)}\n</ghl_business>` : '<ghl_business>none</ghl_business>'
+  ].join('\n');
+
+  const messages = [{ role: 'user', content: userMessage }];
+
+  const response = await callAnthropicWithRetry({
+    maxTokens: MAX_TOKENS_SYNTHESIS,
+    system: buildSynthesisSystemPrompt(),
+    messages,
+    tools: [EMIT_ENRICHMENT_TOOL],
+    toolChoice: { type: 'tool', name: 'emit_enrichment' },
+    timeoutMs: SYNTHESIS_TIMEOUT_MS
+  });
+
+  const usage = response.usage || {};
+  console.log(`[synthesis] stop=${response.stop_reason} in=${usage.input_tokens || 0} out=${usage.output_tokens || 0} elapsed=${((Date.now() - startTime) / 1000).toFixed(1)}s`);
+
+  const assistantContent = response.content || [];
+  const emitBlock = assistantContent.find(b => b.type === 'tool_use' && b.name === 'emit_enrichment');
+  if (!emitBlock) {
+    const fallbackText = assistantContent.filter(b => b.type === 'text').map(b => b.text).join('\n').substring(0, 1000);
+    throw new Error(`synthesis_no_emit: stop_reason=${response.stop_reason} text="${fallbackText}"`);
+  }
+  return emitBlock.input || {};
+}
+
+// Build a synthetic emit_enrichment payload for the failure path when Stage 1
+// could not gather enough data to even call emit_research_findings. This keeps
+// Stage 3 deterministic — it always receives a well-formed enrichment object.
+function buildFailureEnrichment({ findings, partialAssistantText, contactRecord, error }) {
+  const contact = (contactRecord && contactRecord.contact) || {};
+  const knownLines = [];
+  if (contact.firstName || contact.lastName) knownLines.push(`Name: ${[contact.firstName, contact.lastName].filter(Boolean).join(' ')}`);
+  if (contact.email) knownLines.push(`Email: ${contact.email}`);
+  if (contact.phone) knownLines.push(`Phone: ${contact.phone}`);
+  if (contact.companyName) knownLines.push(`Company: ${contact.companyName}`);
+  if (contact.source) knownLines.push(`Lead source: ${contact.source}`);
+  const what_we_know = knownLines.join('\n') || 'Only the contact record exists.';
+
+  const sources = (findings && findings.sources_used) || [];
+  const what_we_tried = sources.length
+    ? `Attempted: ${sources.join(', ')}. ${error ? `Stage 1 outcome: ${error}.` : ''}`.trim()
+    : `Stage 1 outcome: ${error || 'research did not complete'}. Sources attempted unknown.`;
+
+  return {
+    classification: 'failure',
+    icp_score: 0,
+    confidence_level: 'Very Low',
+    icp_segment: 'Enrichment Failed',
+    engagement_signal: '',
+    icp_scoring_breakdown: 'Not scored — insufficient data.',
+    name_corrections: {},
+    contact_fields: {
+      enrichment_status: 'Enrichment Failed',
+      enrichment_source: sources.length ? sources.join(' | ') : 'None'
+    },
+    business_fields: {},
+    brief: {
+      who: contact.firstName || contact.lastName ? `${[contact.firstName, contact.lastName].filter(Boolean).join(' ')} (limited data available).` : '',
+      failure_what_we_know: what_we_know,
+      failure_what_we_tried: what_we_tried,
+      failure_next_steps: 'Manual research recommended: try Sunbiz.org, reverse phone lookup, Google Maps for business listings, LinkedIn search by name + city. The call itself is likely the best enrichment source.',
+      opening_angles: [
+        contact.source
+          ? `Open with the lead source: "Hi ${contact.firstName || 'there'}, thanks for reaching out via ${contact.source} — I'd love to learn a bit more about what you're working on."`
+          : `Open warm: "Hi ${contact.firstName || 'there'}, reaching out as a follow-up — wanted to learn a bit more about what you do and see if there's a fit."`,
+        'Limited enrichment data: ask discovery questions early to learn industry, services, and geography.'
+      ],
+      contact_info: [
+        contact.email ? `Email: ${contact.email}` : null,
+        contact.phone ? `Phone: ${contact.phone}` : null
+      ].filter(Boolean).join('\n')
+    }
+  };
+}
+
+// ─── Stage 3: Brief formatter (deterministic) ──────────────────────────────
+
+function formatBrief(enrichment, { contactName, companyName }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const score = enrichment.icp_score != null ? enrichment.icp_score : 0;
+  const confidence = enrichment.confidence_level || 'Very Low';
+  const segment = enrichment.icp_segment || '';
+  const classification = enrichment.classification || 'failure';
+  const brief = enrichment.brief || {};
+  const angles = (brief.opening_angles || []).map((line, idx) => `${idx + 1}. ${line}`).join('\n');
+
+  const headerLine1 = (header) => `${header} - ${contactName || 'Unknown Contact'} / ${companyName || 'Unknown Company'}`;
+
+  if (classification === 'partner') {
+    return [
+      headerLine1('🤝 PARTNER BRIEF'),
+      `Generated: ${today} | ICP Score: ${score}/100 (Partner Classification) | Segment: ${segment}`,
+      '',
+      'WHO THEY ARE:',
+      brief.who || '',
+      ...(brief.company ? ['', 'THE COMPANY:', brief.company] : []),
+      '',
+      'PARTNERSHIP POTENTIAL:',
+      brief.partner_partnership_potential || '',
+      '',
+      'REFERRAL/INTEGRATION ANGLE:',
+      brief.partner_referral_angle || '',
+      ...(brief.partner_considerations ? ['', 'CONSIDERATIONS:', brief.partner_considerations] : []),
+      '',
+      'OPENING ANGLES:',
+      angles,
+      ...(brief.contact_info ? ['', brief.contact_info] : [])
+    ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  if (classification === 'low_fit') {
+    return [
+      headerLine1('🔍 AI ENRICHMENT PRE-CALL BRIEF'),
+      `Generated: ${today} | ICP Score: ${score}/100 (${confidence} Confidence) | Segment: ${segment}`,
+      '',
+      'ℹ️ LOW ICP MATCH - SEE NOTES',
+      '',
+      'WHO HE/SHE IS:',
+      brief.who || '',
+      '',
+      'THE COMPANY:',
+      brief.company || '',
+      ...(brief.lead_source ? ['', `LEAD SOURCE: ${brief.lead_source}`] : []),
+      '',
+      'ICP NOTES:',
+      brief.low_fit_icp_notes || '',
+      '',
+      'POSSIBLE ANGLES:',
+      brief.low_fit_possible_angles || '',
+      '',
+      'OPENING ANGLES:',
+      angles,
+      ...(enrichment.icp_scoring_breakdown ? ['', `ICP SCORING BREAKDOWN: ${enrichment.icp_scoring_breakdown}`] : []),
+      ...(brief.contact_info ? ['', brief.contact_info] : [])
+    ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  if (classification === 'failure') {
+    return [
+      '⚠️ ENRICHMENT FAILED - MANUAL RESEARCH REQUIRED',
+      `Generated: ${today}`,
+      '',
+      'WHAT WE KNOW:',
+      brief.failure_what_we_know || '',
+      '',
+      'WHAT WE TRIED:',
+      brief.failure_what_we_tried || '',
+      '',
+      `ICP SCORE: ${score}/100 (${confidence} Confidence) - score cannot be trusted due to insufficient data`,
+      '',
+      'RECOMMENDED NEXT STEPS:',
+      brief.failure_next_steps || '',
+      '',
+      'OPENING ANGLES:',
+      angles,
+      ...(brief.contact_info ? ['', brief.contact_info] : [])
+    ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  // Default: customer
+  const customerHeader = score >= 90
+    ? '⭐⭐ TOP PRIORITY LEAD'
+    : (brief.header_flag || '');
+  return [
+    headerLine1('🔍 AI ENRICHMENT PRE-CALL BRIEF'),
+    `Generated: ${today} | ICP Score: ${score}/100 (${confidence} Confidence) | Segment: ${segment}`,
+    ...(enrichment.engagement_signal ? [`Signal: ${enrichment.engagement_signal}`] : []),
+    ...(customerHeader ? ['', customerHeader] : []),
+    '',
+    'WHO HE/SHE IS:',
+    brief.who || '',
+    '',
+    'THE COMPANY:',
+    brief.company || '',
+    ...(brief.lead_source ? ['', `LEAD SOURCE: ${brief.lead_source}`] : []),
+    '',
+    'WHY TerraGenie FITS:',
+    brief.customer_why_fits || '',
+    '',
+    'OPENING ANGLES:',
+    angles,
+    ...(brief.customer_deal_size ? ['', `POTENTIAL DEAL SIZE: ${brief.customer_deal_size}`] : []),
+    ...(enrichment.icp_scoring_breakdown ? ['', `ICP SCORING BREAKDOWN: ${enrichment.icp_scoring_breakdown}`] : []),
+    ...(brief.contact_info ? ['', brief.contact_info] : [])
+  ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// ─── Stage 3: Writeback ────────────────────────────────────────────────────
+
+async function writeContactFields({ contactId, enrichment, existingContactSource }) {
+  const today = new Date().toISOString().slice(0, 10);
+  const cf = enrichment.contact_fields || {};
+  const corr = enrichment.name_corrections || {};
+
+  // Build custom field values, with stage-injected fields appended.
+  const fieldValues = { ...cf, enrichment_date: today };
+
+  // Preserve existing Contact Source if it has a value (skill rule).
+  if (existingContactSource && fieldValues.contact_source) {
+    delete fieldValues.contact_source;
+  }
+
+  // Append " | AI Synthesis" to enrichment_source if not already present.
+  if (fieldValues.enrichment_source && !/AI Synthesis/i.test(fieldValues.enrichment_source)) {
+    fieldValues.enrichment_source = `${fieldValues.enrichment_source} | AI Synthesis`.replace(/^\s*\|\s*/, '');
+  } else if (!fieldValues.enrichment_source) {
+    fieldValues.enrichment_source = 'AI Synthesis';
+  }
+
+  const customFields = buildContactCustomFieldsArray(fieldValues);
+
+  const payload = { customFields };
+  if (corr.first_name) payload.firstName = corr.first_name;
+  if (corr.last_name) payload.lastName = corr.last_name;
+  if (corr.company_name) payload.companyName = corr.company_name;
+
+  return ghlUpdateContact(contactId, payload);
+}
+
+async function writeBusinessFields({ businessId, enrichment }) {
+  if (!businessId) {
+    console.log('[writeback] no businessId on contact — skipping update_business');
+    return { skipped: true };
+  }
+  const bf = enrichment.business_fields || {};
+  const corr = enrichment.name_corrections || {};
+
+  const payload = {};
+  // Apply name correction to the business as well.
+  if (corr.company_name) payload.name = corr.company_name;
+  else if (bf.name) payload.name = bf.name;
+
+  for (const key of ['website', 'phone', 'email', 'address', 'city', 'state', 'description']) {
+    if (bf[key] && String(bf[key]).trim()) payload[key] = bf[key];
+  }
+  if (bf.postal_code && String(bf.postal_code).trim()) payload.postalCode = bf.postal_code;
+  if (bf.country && String(bf.country).trim()) payload.country = bf.country;
+
+  if (Object.keys(payload).length === 0) {
+    console.log('[writeback] no business fields to write — skipping update_business');
+    return { skipped: true };
+  }
+  return ghlUpdateBusiness(businessId, payload);
+}
+
+async function createPreCallBriefNote({ contactId, enrichment, contactName, companyName }) {
+  const briefText = formatBrief(enrichment, { contactName, companyName });
+  return ghlCreateContactNote(contactId, briefText);
+}
+
+async function runWriteback({ contactId, contactRecord, enrichment }) {
+  const contact = (contactRecord && contactRecord.contact) || {};
+  const businessId = contact.businessId || null;
+  const existingContactSource = contact.source || null;
+  const corr = enrichment.name_corrections || {};
+  const contactName = [
+    corr.first_name || contact.firstName,
+    corr.last_name || contact.lastName
+  ].filter(Boolean).join(' ').trim() || contact.email || 'Unknown Contact';
+  const companyName = corr.company_name || contact.companyName || 'Unknown Company';
+
+  // Run all three writes in parallel. Each is exactly once. Failure of one
+  // does not block the others — collect results and downgrade status if any
+  // failed.
+  const [contactResult, businessResult, noteResult] = await Promise.allSettled([
+    writeContactFields({ contactId, enrichment, existingContactSource }),
+    writeBusinessFields({ businessId, enrichment }),
+    createPreCallBriefNote({ contactId, enrichment, contactName, companyName })
+  ]);
+
+  const failures = [];
+  if (contactResult.status === 'rejected') failures.push(`update_contact: ${contactResult.reason && contactResult.reason.message}`);
+  if (businessResult.status === 'rejected') failures.push(`update_business: ${businessResult.reason && businessResult.reason.message}`);
+  if (noteResult.status === 'rejected') failures.push(`create_contact_note: ${noteResult.reason && noteResult.reason.message}`);
+
+  if (failures.length > 0) {
+    console.error(`[writeback] ${failures.length} write(s) failed: ${failures.join(' | ')}`);
+    // Best-effort: try to mark Enrichment Status as Partially Enriched so the
+    // GHL UI reflects reality. Skip if the original update_contact already
+    // succeeded — the existing write captured the field. If update_contact
+    // failed, attempt a smaller follow-up.
+    if (contactResult.status === 'rejected') {
+      try {
+        await ghlUpdateContact(contactId, {
+          customFields: buildContactCustomFieldsArray({
+            enrichment_status: 'Partially Enriched',
+            enrichment_date: new Date().toISOString().slice(0, 10)
+          })
+        });
+        console.log('[writeback] Partially Enriched marker applied via fallback update_contact');
+      } catch (err) {
+        console.error(`[writeback] fallback update_contact failed: ${err.message}`);
+      }
+    }
+  }
+
+  return {
+    ok: failures.length === 0,
+    contactId,
+    failures,
+    note_id: noteResult.status === 'fulfilled' ? (noteResult.value && noteResult.value.note && noteResult.value.note.id) : null
+  };
+}
+
+// ─── Idempotency guard (function-level) ────────────────────────────────────
+
+function isAlreadyEnrichedToday(contactRecord) {
+  const today = new Date().toISOString().slice(0, 10);
+  const status = readContactCustomField(contactRecord, 'enrichment_status');
+  const date = readContactCustomField(contactRecord, 'enrichment_date');
+  if (!status || !date) return false;
+  // Enrichment Date is stored as YYYY-MM-DD. Trim any time component just in case.
+  const dateStr = String(date).slice(0, 10);
+  return status === 'Fully Enriched' && dateStr === today;
+}
+
+// ─── Pipeline orchestrator ─────────────────────────────────────────────────
+
+async function runEnrichment(contactId) {
+  const startTime = Date.now();
+  console.log(`[enrich] start contact=${contactId}`);
+
+  // Load contact up front for idempotency check + Stage 2 input.
+  let contactRecord;
+  try {
+    contactRecord = await ghlGetContact(contactId);
+  } catch (err) {
+    return { ok: false, stage: 'preflight', error: `get_contact_failed: ${err.message}` };
+  }
+
+  if (isAlreadyEnrichedToday(contactRecord)) {
+    console.log(`[enrich] idempotency: contact already Fully Enriched today — skipping`);
+    return { ok: true, skipped: true, reason: 'already_enriched_today' };
+  }
+
+  // Try to load the linked business early so Stage 2 has it.
+  const contact = (contactRecord && contactRecord.contact) || {};
+  let businessRecord = null;
+  if (contact.businessId) {
+    try {
+      businessRecord = await ghlGetBusiness(contact.businessId);
+    } catch (err) {
+      console.warn(`[enrich] get_business failed (non-fatal): ${err.message}`);
+    }
+  }
+
+  // Stage 1: research loop.
+  const stageDeadline = ENRICHMENT_DEADLINE_MS - (Date.now() - startTime);
+  const research = await runResearchLoop(contactId, Math.max(60_000, stageDeadline - 120_000));
+
+  // Stage 2: synthesis (or failure-payload fallback).
+  let enrichment;
+  if (research.ok) {
+    try {
+      enrichment = await synthesizeEnrichment({
+        findings: research.findings,
+        contactId,
+        contactRecord,
+        businessRecord
+      });
+    } catch (err) {
+      console.error(`[enrich] synthesis failed: ${err.message}`);
+      enrichment = buildFailureEnrichment({
+        findings: research.findings,
+        partialAssistantText: research.findings && research.findings.research_summary,
+        contactRecord,
+        error: `synthesis_failed: ${err.message}`
+      });
+    }
+  } else {
+    console.warn(`[enrich] research failed: ${research.error} — falling through to failure-brief writeback`);
+    enrichment = buildFailureEnrichment({
+      findings: null,
+      partialAssistantText: research.partialAssistantText,
+      contactRecord,
+      error: research.error
+    });
+  }
+
+  // Stage 3: writeback (deterministic, runs even on the failure path).
+  let writeback;
+  try {
+    writeback = await runWriteback({ contactId, contactRecord, enrichment });
+  } catch (err) {
+    console.error(`[enrich] writeback threw: ${err.message}`);
+    return {
+      ok: false,
+      stage: 'writeback',
+      error: `writeback_threw: ${err.message}`,
+      research_turns: research.turns,
+      classification: enrichment && enrichment.classification
+    };
+  }
+
+  const elapsedSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
+
+  if (!research.ok || enrichment.classification === 'failure') {
+    return {
+      ok: false,
+      stage: research.ok ? 'synthesis_or_classification_failure' : 'research',
+      error: research.ok ? `synthesis_classified_as_failure` : research.error,
+      research_turns: research.turns,
+      writeback_failures: writeback.failures || [],
+      brief_written: writeback.note_id != null,
+      classification: enrichment.classification,
+      elapsedSeconds
+    };
+  }
+
+  return {
+    ok: writeback.ok,
+    stage: 'complete',
+    research_turns: research.turns,
+    classification: enrichment.classification,
+    icp_score: enrichment.icp_score,
+    icp_segment: enrichment.icp_segment,
+    confidence_level: enrichment.confidence_level,
+    note_id: writeback.note_id,
+    writeback_failures: writeback.failures || [],
+    elapsedSeconds
+  };
 }
 
 // ─── Main webhook handler ──────────────────────────────────────────────────
 
 const handler = async (req, res) => {
-  // 1. Server-config sanity check (auth secret must exist)
   const SECRET = process.env.WEBHOOK_SECRET;
   if (!SECRET || SECRET.length < 16) {
     res.status(500).json({ error: 'Server configuration error' });
     return;
   }
 
-  // 2. Method
   if (req.method !== 'POST') {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
 
-  // 3. Auth
   if (!req.headers || req.headers.authorization !== `Bearer ${SECRET}`) {
     console.log('[enrich-webhook] Rejected: bad or missing Authorization header');
     res.status(401).json({ error: 'Unauthorized' });
     return;
   }
 
-  // 4. Required env vars (need all four for Phase 2 to work)
-  const required = ['ANTHROPIC_API_KEY', 'APOLLO_API_KEY', 'FIRECRAWL_API_KEY', 'MCP_PATH_SECRET'];
+  const required = ['ANTHROPIC_API_KEY', 'APOLLO_API_KEY', 'FIRECRAWL_API_KEY', 'GHL_API_KEY'];
   const missing = required.filter(k => !process.env[k]);
   if (missing.length) {
     console.error('[enrich-webhook] Missing env vars:', missing);
@@ -631,7 +1304,6 @@ const handler = async (req, res) => {
     return;
   }
 
-  // 5. Parse body
   let body = '';
   await new Promise((resolve, reject) => {
     req.on('data', chunk => { body += chunk.toString(); });
@@ -647,7 +1319,6 @@ const handler = async (req, res) => {
     return;
   }
 
-  // 6. Extract contact ID (GHL field names vary by trigger)
   const contactId =
     payload.contact_id || payload.contactId || payload.id ||
     (payload.contact && (payload.contact.id || payload.contact.contact_id));
@@ -660,12 +1331,6 @@ const handler = async (req, res) => {
 
   console.log(`[enrich-webhook] Webhook received for contact ${contactId}`);
 
-  // 7. Ack GHL IMMEDIATELY so its 60s webhook timeout is satisfied. The full
-  // enrichment runs after this response (continues in the same Vercel function
-  // instance — Fluid Compute keeps it alive until maxDuration or natural exit).
-  // The actual writeback to GHL (custom fields + brief note) happens via direct
-  // GHL API calls inside the agent loop, so GHL gets all enrichment data via
-  // that channel — not via this webhook response.
   res.status(200).json({
     ok: true,
     contactId,
@@ -673,38 +1338,22 @@ const handler = async (req, res) => {
     received_at: new Date().toISOString()
   });
 
-  // 8. Run enrichment AFTER ack. Use waitUntil() so Vercel keeps the function
-  // instance alive until the enrichment promise resolves. A bare `await` after
-  // res.json() is unreliable — Vercel can freeze the v8 context once the
-  // response is flushed. waitUntil() is the documented mechanism for extending
-  // function lifetime past the response, bounded by maxDuration. Errors are
-  // logged only — we cannot send a 2nd HTTP response (headers already sent).
-  // Failures (both thrown and returned-with-ok=false) trigger an optional
-  // notification webhook plus a [ENRICHMENT_FAILURE] log line for grep.
-  // runEnrichment now handles brief verification + recovery internally.
-  // If it returns ok:true, the brief either landed or was unverifiable
-  // (e.g., GHL API key missing). If it returns ok:false with reason
-  // "brief_missing_after_N_recovery_attempts", recovery was exhausted and
-  // we fire a Slack alert via the standard failure path below.
   waitUntil(
     runEnrichment(contactId)
       .then(async (result) => {
         if (result && result.ok) {
-          const verifyTag =
-            result.briefVerified === true ? ' (brief verified)'
-            : result.briefVerified === null ? ' (brief unverified — verification skipped)'
-            : '';
-          console.log(`[enrich-webhook] Background enrichment complete${verifyTag}: ${JSON.stringify(result).substring(0, 800)}`);
+          console.log(`[enrich-webhook] Background enrichment complete: ${JSON.stringify(result).substring(0, 800)}`);
           return;
         }
         const reason = (result && result.error) || 'unknown';
-        const turns = result && result.turns;
-        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} reason=${reason} turns=${turns}`);
+        const stage = (result && result.stage) || 'unknown';
+        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} stage=${stage} reason=${reason}`);
         await postFailureNotification({
-          source: /brief_missing/i.test(reason) ? 'missing_brief' : 'returned_failure',
+          source: 'returned_failure',
           contactId,
           reason,
-          turns,
+          stage,
+          turns: result && result.research_turns,
           timestamp: new Date().toISOString()
         });
       })
@@ -716,6 +1365,7 @@ const handler = async (req, res) => {
           source: 'thrown_error',
           contactId,
           reason: msg.substring(0, 500),
+          stage: 'pipeline',
           turns: null,
           timestamp: new Date().toISOString()
         });
@@ -724,9 +1374,3 @@ const handler = async (req, res) => {
 };
 
 module.exports = handler;
-// Tell Vercel this function may run up to ~13 min (Vercel Pro Fluid Compute
-// max is 800s). The function acks GHL within ~1s and continues running the
-// enrichment in the background — the maxDuration bounds the total work.
-// ENRICHMENT_DEADLINE_MS at the top of the file is set 50s below this so
-// the deadline guard fires Slack alerts cleanly before Vercel hard-kills.
-module.exports.config = { maxDuration: 800 };
