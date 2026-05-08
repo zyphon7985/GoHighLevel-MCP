@@ -653,34 +653,105 @@ async function callAnthropicWithRetry(args, maxAttempts = 2) {
 
 // ─── Failure notification (Slack-friendly universal payload) ───────────────
 
-function buildNotificationPayload({ source, contactId, reason, stage, turns, timestamp }) {
+// Map terse stage / source / reason codes to a human-readable explanation.
+// Helps Rob and anyone else reading the Slack alert understand what failed
+// without having to know the codebase's internal vocabulary.
+function humanizeStage(stage) {
+  switch (stage) {
+    case 'preflight': return 'Preflight (loading contact / idempotency check)';
+    case 'research': return 'Stage 1 (Research)';
+    case 'synthesis_or_classification_failure': return 'Stage 2 (Synthesis) or classification fell through to Failure brief';
+    case 'writeback': return 'Stage 3 (Writeback to GHL)';
+    case 'pipeline': return 'Pipeline (uncaught exception)';
+    case 'complete': return 'Complete (writeback failures present)';
+    case 'unknown': default: return stage || 'Unknown';
+  }
+}
+
+function humanizeSource(source) {
+  switch (source) {
+    case 'thrown_error': return 'The pipeline function threw an uncaught exception.';
+    case 'returned_failure': return 'The pipeline returned a structured failure result.';
+    case 'missing_brief': return 'Stage 1 completed but the Pre-Call Brief note was not created.';
+    default: return source || 'Unknown';
+  }
+}
+
+function humanizeReason(reason) {
+  if (!reason) return 'Unknown reason.';
+  if (/get_contact_failed/.test(reason)) {
+    return 'Could not load the contact from GHL during preflight. Most likely a transient GHL API outage or an invalid contact ID. Detail: ' + reason;
+  }
+  if (/research_deadline_exceeded/.test(reason)) {
+    return 'The research stage exceeded its time budget without calling emit_research_findings. Most likely the agent got stuck on slow scrapes or a heavy turn loop. Detail: ' + reason;
+  }
+  if (/research_ended_without_emit/.test(reason)) {
+    return 'The research agent ended its turn without calling emit_research_findings. The agent decided to stop without producing structured findings. Detail: ' + reason;
+  }
+  if (/max_research_turns_exceeded/.test(reason)) {
+    return 'The research agent hit the MAX_RESEARCH_TURNS=30 cap without calling emit_research_findings. Likely an infinite tool loop or the agent could not converge. Detail: ' + reason;
+  }
+  if (/synthesis_no_emit/.test(reason)) {
+    return 'The synthesis stage returned without calling emit_enrichment despite tool_choice forcing it. Almost always a model API anomaly. Detail: ' + reason;
+  }
+  if (/synthesis_failed/.test(reason)) {
+    return 'The synthesis Anthropic call failed (network, timeout, or API error). Detail: ' + reason;
+  }
+  if (/writeback_threw/.test(reason)) {
+    return 'GHL writeback threw an uncaught exception. Most likely a GHL API outage or auth / payload issue. Detail: ' + reason;
+  }
+  if (/synthesis_classified_as_failure/.test(reason)) {
+    return 'The synthesis stage classified the lead as Failure (insufficient data after fallback chain). A failure-template brief was written. Detail: ' + reason;
+  }
+  if (/unexpected_stop_reason/.test(reason)) {
+    return 'The research agent returned a stop_reason that the loop did not know how to handle. Detail: ' + reason;
+  }
+  return reason;
+}
+
+function buildNotificationPayload({ source, contactId, contactName, reason, stage, turns, timestamp }) {
   const ghlLoc = process.env.GHL_LOCATION_ID;
   const contactUrl = ghlLoc
     ? `https://app.gohighlevel.com/v2/location/${ghlLoc}/contacts/detail/${contactId}`
     : null;
-  const logsUrl = 'https://vercel.com/robvaniglia-gmailcoms-projects/go-high-level-mcp/logs';
+  // Deep-link Vercel logs to events mentioning the contact ID. The query
+  // filter matches against log message text — every meaningful log line
+  // includes the contact ID, so this scopes to just this run's events.
+  const logsUrl = `https://vercel.com/robvaniglia-gmailcoms-projects/go-high-level-mcp/logs?query=${encodeURIComponent(contactId)}`;
+  const userMention = process.env.SLACK_NOTIFY_USER_ID
+    ? `<@${process.env.SLACK_NOTIFY_USER_ID}>`
+    : '';
+
+  const stageHuman = humanizeStage(stage);
+  const sourceHuman = humanizeSource(source);
+  const reasonHuman = humanizeReason(reason);
+  const displayName = contactName && contactName.trim() ? contactName.trim() : '(name unavailable)';
 
   const lines = [
-    '*Lead enrichment failed*',
-    `*Contact:* \`${contactId}\``,
-    `*Stage:* ${stage}`,
-    `*Reason:* ${reason}`,
-    `*Source:* ${source}`
+    `${userMention ? userMention + ' — ' : ''}*Lead enrichment failed*`.trim(),
+    `*Contact:* ${displayName} (\`${contactId}\`)`,
+    `*Stage:* ${stageHuman}`,
+    `*Source:* ${sourceHuman}`,
+    `*Reason:* ${reasonHuman}`
   ];
   if (turns != null) lines.push(`*Research turns:* ${turns}`);
   lines.push(`*Time:* ${timestamp}`);
   const linkParts = [];
   if (contactUrl) linkParts.push(`<${contactUrl}|View contact in GHL>`);
-  linkParts.push(`<${logsUrl}|Open Vercel logs>`);
+  linkParts.push(`<${logsUrl}|Open Vercel logs (filtered to this contact)>`);
   lines.push(linkParts.join(' | '));
 
   return {
     text: lines.join('\n'),
     event: 'lead_enrichment_failed',
     source,
+    source_human: sourceHuman,
     stage,
+    stage_human: stageHuman,
     contact_id: contactId,
+    contact_name: contactName || null,
     reason,
+    reason_human: reasonHuman,
     turns,
     timestamp,
     contact_url: contactUrl,
@@ -701,6 +772,25 @@ async function postFailureNotification(args) {
     console.log(`[enrich-webhook] notification posted status=${res.status}`);
   } catch (err) {
     console.error(`[enrich-webhook] notification webhook errored: ${err.message}`);
+  }
+}
+
+// Best-effort name fetch for the Slack alert when runEnrichment didn't
+// surface one (e.g., a thrown exception before contact load completed).
+// Wrapped in try/catch so notification failures never mask the original
+// error.
+async function fetchContactNameBestEffort(contactId) {
+  try {
+    const resp = await ghlGetContact(contactId);
+    const c = (resp && resp.contact) || {};
+    const full = [c.firstName, c.lastName].filter(Boolean).join(' ').trim();
+    if (full) return full;
+    if (c.companyName) return c.companyName;
+    if (c.email) return c.email;
+    return null;
+  } catch (err) {
+    console.warn(`[enrich-webhook] fetchContactNameBestEffort failed: ${err.message}`);
+    return null;
   }
 }
 
@@ -1213,16 +1303,24 @@ async function runEnrichment(contactId) {
   try {
     contactRecord = await ghlGetContact(contactId);
   } catch (err) {
-    return { ok: false, stage: 'preflight', error: `get_contact_failed: ${err.message}` };
+    return { ok: false, stage: 'preflight', contactName: null, error: `get_contact_failed: ${err.message}` };
   }
+
+  // Capture display name early so failures downstream can surface a
+  // human-readable identifier in the Slack alert.
+  const contact = (contactRecord && contactRecord.contact) || {};
+  const contactName =
+    [contact.firstName, contact.lastName].filter(Boolean).join(' ').trim()
+    || contact.companyName
+    || contact.email
+    || null;
 
   if (isAlreadyEnrichedToday(contactRecord)) {
     console.log(`[enrich] idempotency: contact already Fully Enriched today — skipping`);
-    return { ok: true, skipped: true, reason: 'already_enriched_today' };
+    return { ok: true, skipped: true, reason: 'already_enriched_today', contactName };
   }
 
   // Try to load the linked business early so Stage 2 has it.
-  const contact = (contactRecord && contactRecord.contact) || {};
   let businessRecord = null;
   if (contact.businessId) {
     try {
@@ -1274,6 +1372,7 @@ async function runEnrichment(contactId) {
     return {
       ok: false,
       stage: 'writeback',
+      contactName,
       error: `writeback_threw: ${err.message}`,
       research_turns: research.turns,
       classification: enrichment && enrichment.classification
@@ -1286,6 +1385,7 @@ async function runEnrichment(contactId) {
     return {
       ok: false,
       stage: research.ok ? 'synthesis_or_classification_failure' : 'research',
+      contactName,
       error: research.ok ? `synthesis_classified_as_failure` : research.error,
       research_turns: research.turns,
       writeback_failures: writeback.failures || [],
@@ -1298,6 +1398,7 @@ async function runEnrichment(contactId) {
   return {
     ok: writeback.ok,
     stage: 'complete',
+    contactName,
     research_turns: research.turns,
     classification: enrichment.classification,
     icp_score: enrichment.icp_score,
@@ -1380,10 +1481,12 @@ const handler = async (req, res) => {
         }
         const reason = (result && result.error) || 'unknown';
         const stage = (result && result.stage) || 'unknown';
-        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} stage=${stage} reason=${reason}`);
+        const contactName = (result && result.contactName) || await fetchContactNameBestEffort(contactId);
+        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} name="${contactName || ''}" stage=${stage} reason=${reason}`);
         await postFailureNotification({
           source: 'returned_failure',
           contactId,
+          contactName,
           reason,
           stage,
           turns: result && result.research_turns,
@@ -1392,11 +1495,13 @@ const handler = async (req, res) => {
       })
       .catch(async (err) => {
         const msg = (err && err.message) || 'unknown error';
-        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} threw: ${msg}`);
+        const contactName = await fetchContactNameBestEffort(contactId);
+        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} name="${contactName || ''}" threw: ${msg}`);
         if (err && err.stack) console.error(err.stack);
         await postFailureNotification({
           source: 'thrown_error',
           contactId,
+          contactName,
           reason: msg.substring(0, 500),
           stage: 'pipeline',
           turns: null,
