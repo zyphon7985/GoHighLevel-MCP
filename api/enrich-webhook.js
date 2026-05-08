@@ -15,17 +15,18 @@ const ANTHROPIC_BETA = 'mcp-client-2025-11-20';
 const MODEL = 'claude-sonnet-4-6';  // Switch to 'claude-opus-4-7' for max quality at ~5x cost
 const MAX_TOKENS_PER_TURN = 4096;
 const MAX_TURNS = 30;  // Safety cap on agent loop iterations
-// Per-turn fetch timeout for the Anthropic API (first attempt). Tuned for
-// the 800s Vercel Pro function ceiling. A normal turn returns in 5-30s;
-// 180s gives heavy turns (large accumulated context + content-rich tool
-// results) plenty of room to complete without retrying.
-const PER_TURN_TIMEOUT_MS = 180 * 1000;
+// Per-turn fetch timeout for the Anthropic API (first attempt). Sized to
+// fit inside the 300s ceiling that applies until Vercel Fluid Compute is
+// enabled at the project level (Settings → Functions → Fluid Compute).
+// Once Fluid Compute is on (granting 800s), bump these back to 180s/300s
+// in callAnthropicWithRetry and 750s here.
+const PER_TURN_TIMEOUT_MS = 90 * 1000;
 // Total enrichment budget. We proactively bail before this elapsed time so
 // postFailureNotification has a chance to fire cleanly. Vercel hard-kills
-// the function at maxDuration (800s on Pro) without unwinding the promise
-// chain, which would otherwise drop the .catch handler and skip the Slack
-// alert. 50s of cleanup headroom keeps the alert path reliable.
-const ENRICHMENT_DEADLINE_MS = 750 * 1000;
+// the function at maxDuration without unwinding the promise chain, which
+// would otherwise drop the .catch handler and skip the Slack alert. 30s
+// of cleanup headroom inside the empirical 300s ceiling.
+const ENRICHMENT_DEADLINE_MS = 270 * 1000;
 
 // The lead-enrichment skill content, JSON-escaped at build time so it can be
 // embedded as a JS string literal. The agent's system prompt wraps this with
@@ -150,6 +151,13 @@ async function execApolloOrgEnrich(input) {
   return JSON.parse(text);
 }
 
+// Cap on markdown returned to the agent. Restored to fit inside the 300s
+// Vercel ceiling that applies until Fluid Compute is enabled. Enterprise
+// sites can return 80+ KB of markdown which inflates the next turn's body
+// to a size Anthropic can't process in 90s. Once Fluid Compute is on and
+// timeouts move to 180s/300s, this cap can be removed (or raised).
+const FIRECRAWL_MARKDOWN_MAX_CHARS = 25000;
+
 async function execFirecrawlScrape(input) {
   const body = {
     url: input.url,
@@ -166,11 +174,18 @@ async function execFirecrawlScrape(input) {
   });
   const text = await res.text();
   if (!res.ok) throw new Error(`Firecrawl scrape ${res.status}: ${text.substring(0, 500)}`);
-  // No size truncation — Vercel Pro's 800s function ceiling combined with
-  // adaptive 180s/300s per-turn timeouts gives Anthropic enough room to
-  // process full enterprise-site markdown. The agent gets every signal the
-  // page surfaces and can extract anywhere on it.
-  return JSON.parse(text);
+  const result = JSON.parse(text);
+
+  const md = result && result.data && result.data.markdown;
+  if (typeof md === 'string' && md.length > FIRECRAWL_MARKDOWN_MAX_CHARS) {
+    const original = md.length;
+    result.data.markdown =
+      md.substring(0, FIRECRAWL_MARKDOWN_MAX_CHARS) +
+      `\n\n[CONTENT TRUNCATED — original markdown was ${original} characters; truncated to ${FIRECRAWL_MARKDOWN_MAX_CHARS} to fit Anthropic processing budget. If you need more detail, call firecrawl_scrape on a more specific URL such as /about, /services, /products, or /our-work.]`;
+    console.log(`[firecrawl_scrape] truncated markdown ${original} -> ${FIRECRAWL_MARKDOWN_MAX_CHARS} for url=${input.url}`);
+  }
+
+  return result;
 }
 
 async function execFirecrawlSearch(input) {
@@ -290,14 +305,13 @@ async function callAnthropic(messages, timeoutMs = PER_TURN_TIMEOUT_MS) {
 // still throw immediately — they will not be cured by retry.
 
 async function callAnthropicWithRetry(messages, maxAttempts = 2) {
-  // Adaptive per-attempt timeout. Heavy turns (large accumulated context plus
-  // content-rich tool results) genuinely need extra time to process. The
-  // first attempt uses 180s; if that fails, the retry gets 300s. Worst case
-  // per stuck turn = 180s + 1s backoff + 300s = 481s, well under the 750s
-  // deadline guard on Vercel Pro (800s function ceiling). The same body
-  // retried with the same first-attempt window would just hit the same
-  // wall — that pattern caused early real-lead failures.
-  const timeoutSchedule = [PER_TURN_TIMEOUT_MS, 300 * 1000];
+  // Adaptive per-attempt timeout. Sized for the 300s Vercel ceiling that
+  // applies until Fluid Compute is enabled. First attempt 90s, retry 150s.
+  // Worst case per stuck turn = 90s + 1s backoff + 150s = 241s, leaves
+  // headroom under the 270s deadline guard. Once Fluid Compute is on,
+  // change this to [PER_TURN_TIMEOUT_MS (180s), 300 * 1000] and bump the
+  // deadline guard at the top of the file.
+  const timeoutSchedule = [PER_TURN_TIMEOUT_MS, 150 * 1000];
   let lastErr;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const attemptTimeout = timeoutSchedule[attempt - 1] || timeoutSchedule[timeoutSchedule.length - 1];
