@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
-  "buildCommand": "npm run build && mkdir -p public",
+  "buildCommand": "npm run build && mkdir -p public && echo 'OK' > public/_health.txt",
   "rewrites": [
     { "source": "/enrich-webhook", "destination": "/api/enrich-webhook" },
     { "source": "/(.*)", "destination": "/api/index" }
