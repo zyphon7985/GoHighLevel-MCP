@@ -42,6 +42,7 @@ const {
   readContactCustomField,
   parseMemory,
   buildMemoryString,
+  scrubDashes,
   callAnthropicWithRetry,
   postFailureNotification
 } = require('./_shared');
@@ -60,27 +61,27 @@ const REQUIRED_ENV = ['WEBHOOK_SECRET', 'ANTHROPIC_API_KEY', 'GHL_API_KEY'];
 
 const EMIT_MEMORY_TOOL = {
   name: 'emit_memory',
-  description: 'Emit the refreshed Communication Memory state. Call exactly once with the complete structured payload.',
+  description: 'Emit the refreshed Communication Memory state. Call exactly once with the complete structured payload. Read the system prompt for the eight rules.',
   input_schema: {
     type: 'object',
     properties: {
       historical_summary: {
         type: 'string',
-        description: '100-500 word prose paragraph capturing the long-term context of this lead. Append-mostly: never remove or contradict existing summary content based on a single new event. Plain prose, no bullets / em dashes / markdown / emoji.'
+        description: '100-500 word prose narrative of the relationship arc. Append-mostly: never remove or contradict existing content based on a single event. Conversation evolution ONLY: do NOT include the contact name, role, company, industry, geography, or lead source (those live in existing_foundation, never duplicate). Plain prose, no bullets, no em dashes, no markdown, no emoji.'
       },
       recent_activity_lines: {
         type: 'array',
         items: { type: 'string' },
         maxItems: 10,
-        description: 'Array of timeline entries, newest first, max 10 entries. Each entry format: "YYYY-MM-DD HH:MM <DIRECTION> <CHANNEL>: <one-line summary>". Older entries beyond 10 should be summarized and folded into historical_summary, not silently dropped.'
+        description: 'Ordered array, newest first, MAXIMUM 10 entries. Each entry format: "YYYY-MM-DD HH:MM <DIRECTION> <CHANNEL>: <summary, max 30 words>". The new event is always the first entry. ROLLOVER: if existing recent had 10 entries and you are adding a new one, take the OLDEST 5, summarize them into historical_summary as new sentences, and REMOVE them from this output array. Result: 6 entries total (new event plus 5 newest existing). Never duplicate entries across historical_summary and recent_activity_lines.'
       },
       foundation_correction_needed: {
         type: 'boolean',
-        description: 'True if the new event reveals identity-level information that contradicts the existing Enrichment Foundation (wrong company, wrong role, wrong industry). False otherwise.'
+        description: 'True if the new event reveals identity-level info that contradicts existing_foundation (wrong role, wrong company, wrong industry, contact left the company). False otherwise. A separate worker handles re-enrichment; do NOT edit Foundation yourself.'
       },
       foundation_correction_note: {
         type: 'string',
-        description: 'Only when foundation_correction_needed=true. One-sentence explanation of what specifically contradicts the Foundation, e.g., "Contact stated they are a landscaper, not a property manager."'
+        description: 'Only populate when foundation_correction_needed=true. One sentence stating what specifically contradicts Foundation, e.g., "Contact stated they are a landscaper, not a property manager."'
       }
     },
     required: ['historical_summary', 'recent_activity_lines', 'foundation_correction_needed']
@@ -88,49 +89,97 @@ const EMIT_MEMORY_TOOL = {
 };
 
 function buildSynthesisSystemPrompt() {
-  return `You maintain the Communication Memory for a sales lead in TerraGenie's GHL CRM. Your job is to integrate a new conversation event into the existing memory, preserving important context and ensuring the structure stays clean.
+  return `You maintain the Communication Memory for a sales lead in TerraGenie's GHL CRM. Your job: integrate one new conversation event while keeping the structure clean and the content non-duplicative.
 
-The Communication Memory has two sections:
-  HISTORICAL SUMMARY: a 100-500 word prose paragraph capturing long-term context (early signals, key objections, sentiment trajectory, milestone events).
-  RECENT ACTIVITY: a list of the last 10 conversation events newest first, each one line.
+INPUTS YOU RECEIVE:
+- existing_memory: the current Memory field, with a HISTORICAL SUMMARY section and a RECENT ACTIVITY section.
+- existing_foundation: the contact's stable identity context (name, role, company, fit). READ-ONLY reference for spotting contradictions. Never copy its content into your output.
+- new_event: the event to integrate (timestamp, direction, channel, text content).
 
-CRITICAL RULES:
+OUTPUTS (via emit_memory tool, exactly once):
+- historical_summary: 100-500 word prose narrative of the conversation arc.
+- recent_activity_lines: ordered array, newest first, max 10 entries.
+- foundation_correction_needed: boolean.
+- foundation_correction_note: string (only when foundation_correction_needed is true).
 
-1. HISTORICAL SUMMARY is append-mostly. NEVER remove or contradict existing summary content based on a single new event. Information promotes from RECENT ACTIVITY into HISTORICAL SUMMARY only when:
-   (a) RECENT ACTIVITY has more than 10 entries and the oldest 5 need to be summarized, OR
-   (b) the new event is a clear milestone (appointment booked, contract signed, opportunity stage advance, churn).
-   A friendly closing message DOES NOT erase a documented complaint or objection. A "thanks, you guys are great" does not retroactively make a previous frustration disappear.
+THE EIGHT RULES:
 
-2. RECENT ACTIVITY is the last 10 events newest first. Each entry: "YYYY-MM-DD HH:MM <DIRECTION> <CHANNEL>: <one-line summary, max 30 words>". Direction is INBOUND or OUTBOUND. Channel is SMS, EMAIL, CALL, BOT_SMS, BOT_EMAIL, BOT_CALL, APPOINTMENT, WORKFLOW.
+1. RECENT ACTIVITY ENTRY FORMAT
+   Each entry must be exactly: "YYYY-MM-DD HH:MM <DIRECTION> <CHANNEL>: <summary, max 30 words>"
+   DIRECTION = INBOUND or OUTBOUND.
+   CHANNEL = SMS, EMAIL, CALL, BOT_SMS, BOT_EMAIL, BOT_CALL, APPOINTMENT, or WORKFLOW.
+   Preserve verbatim quotes for short messages when they convey sentiment or commitment ("Sure! Let's do it.").
 
-3. If the input has more than 10 entries in RECENT ACTIVITY (because /log-event was capping at a higher number), summarize the oldest entries down so output has at most 10 entries. The summarized content folds into historical_summary as new sentences. Do not silently drop entries.
+2. THE NEW EVENT ALWAYS LANDS FIRST
+   The new event is always the first (newest) entry in recent_activity_lines. This is non-negotiable.
 
-4. WRITING STYLE: plain prose. NO em dashes (—). NO en dashes (–). NO bullets. NO markdown. NO emoji. Use commas, periods, parentheses, semicolons. Hyphens are fine for compound words (e.g., "follow-up", "long-term").
+3. ROLLOVER WHEN RECENT WOULD EXCEED 10
+   If existing recent_activity has 10 entries and you are adding the new event (would be 11):
+     a. Take the OLDEST 5 entries (positions 6 through 10 in newest-first order).
+     b. Summarize those 5 into 1-3 new sentences and APPEND them to historical_summary.
+     c. REMOVE those 5 from recent_activity_lines. Do not keep them anywhere in your recent_activity_lines output.
+   Final output structure: recent_activity_lines = [new_event, plus the 5 newest existing entries] = 6 entries total.
+   The 5 oldest entries live ONLY in historical_summary from this point forward. NEVER duplicate them across sections.
 
-5. Identity-level corrections: if the new event reveals that the contact's role / company / industry differs from what's currently documented (e.g., contact says "actually I'm a landscaper, not a property manager"), set foundation_correction_needed=true and write a one-sentence foundation_correction_note. A separate worker will handle Foundation re-enrichment. Do NOT modify Foundation yourself.
+4. WHAT GETS PROMOTED TO HISTORICAL SUMMARY
+   When summarizing rolled-over entries (or noting milestone events), preserve detail for things that change future outreach strategy:
+     - Confirmed objections (pricing, timing, budget, competitor)
+     - Commitments made by the contact (call scheduled, demo booked, decision deadline)
+     - Sentiment shifts (frustration that surfaced, satisfaction expressed)
+     - Pricing discussions (any mention of cost, tier, package)
+     - Complaints, even if resolved (they remain part of the relationship history)
+     - Decision-maker or stakeholder changes
+   Compress at higher abstraction for routine touchpoints: "three reactivation SMS attempts in May went unanswered" rather than three separate sentences.
 
-6. The new event ALWAYS goes into RECENT ACTIVITY as a timeline line, regardless of how it affects HISTORICAL SUMMARY.
+5. HISTORICAL SUMMARY IS APPEND-MOSTLY
+   Never remove or contradict existing historical_summary content based on a single new event. A friendly closing message ("thanks, you guys are great") does NOT erase a prior documented complaint or objection. Both can coexist: "Raised pricing concern in early May which was resolved on the May 15 call. Has since expressed positive sentiment."
 
-7. Output via emit_memory exactly once. That is your only valid output.
+6. NO IDENTITY DUPLICATION
+   Historical_summary is conversation evolution ONLY. Do NOT include the contact's name, role, company name, industry, geography, or lead source in historical_summary. That information lives in existing_foundation; the bot reads it from there. Historical_summary covers what happened in the relationship, not who the person is.
 
-INPUT YOU WILL RECEIVE:
-- existing_memory: the current Communication Memory (both sections, possibly with sentinel content if first event)
-- new_event: structured information about the event to integrate
-- recent_ghl_messages: optional grounding context from GHL's conversation API`;
+7. FOUNDATION CORRECTION DETECTION
+   If the new event reveals identity-level information that contradicts existing_foundation (e.g., "I'm a landscaper, not a property manager"; "I left SDC, I'm at Acme now"), set foundation_correction_needed=true and write a one-sentence foundation_correction_note. A separate worker handles re-enrichment. Do NOT edit Foundation yourself.
+
+8. WRITING STYLE
+   Plain prose only. No em dashes (—). No en dashes (–). No bullets in historical_summary. No markdown. No emoji.
+   Use commas, periods, parentheses, semicolons.
+   Hyphens are fine for compound words (follow-up, long-term, mid-market).
+
+LENGTH BOUNDS:
+- historical_summary: target 100-500 words. Hard cap 3000 words. If approaching cap, compress older content at higher abstraction.
+- recent_activity_lines: maximum 10 entries.
+- per-entry summary: maximum 30 words.
+
+OUTPUT: call emit_memory exactly once. That is your only valid output.`;
 }
 
 function buildPreSummarySystemPrompt() {
-  return `You summarize a long sales conversation event (voice call transcript or long email) into a single timeline entry for a sales lead's communication memory.
+  return `You compress a long sales conversation event (voice call transcript, long email, extended message thread) into a single timeline entry for a sales lead's communication memory.
 
-Output one paragraph, 80-120 words, plain prose. Focus on what's relevant for future outreach:
-- Objections raised
-- Questions asked
-- Commitments made
-- Specific concerns or pain points
-- Next steps agreed
-- Sentiment shift if notable
+The entry will be read by an AI sales bot at the next outreach. Focus exclusively on what changes future strategy:
+  - Objections raised (pricing, timing, budget, competitor, fit)
+  - Questions asked by the contact
+  - Commitments made by the contact (calls scheduled, deliverables agreed)
+  - Specific concerns or pain points
+  - Next steps and timing
+  - Sentiment shifts (notable frustration or notable enthusiasm)
 
-Do NOT include filler. Do NOT use bullets, headers, em dashes, or emoji. Plain prose only. No more than 120 words.`;
+OUTPUT LENGTH (scale to input size):
+  - Input up to 1500 words: produce 80-120 word digest as one paragraph.
+  - Input 1500 to 5000 words: produce 120-180 word digest as one paragraph.
+  - Input over 5000 words: produce 180-220 word digest, structured as one paragraph followed by three labeled lines:
+      "Key objections: ..."
+      "Key commitments: ..."
+      "Next steps: ..."
+
+WRITING STYLE:
+  - Plain prose only. No em dashes (—). No en dashes (–). No markdown. No emoji.
+  - Preserve verbatim quotes for emotionally-charged or commitment-defining lines.
+  - Do not include filler ("they exchanged greetings", "small talk about the weather").
+  - Do not infer beyond what was actually said in the input.
+  - Hyphens are fine for compound words.
+
+Output the digest text only, nothing else.`;
 }
 
 async function preSummarizeEventText(text, eventType) {
@@ -214,9 +263,20 @@ async function refreshMemory({ contactId, event_type, message_text, call_duratio
   }
   const out = emit.input || {};
 
+  // Defense-in-depth safety nets at the write boundary:
+  //  1. Trim recent_activity_lines to a hard maximum of 10 entries (the
+  //     synthesis prompt asks for this but compliance is not 100%).
+  //  2. Scrub em dashes and en dashes from both sections (Rob's no-em-dashes
+  //     rule; the synthesis prompt asks for this too but slips happen).
+  const cappedRecentLines = (out.recent_activity_lines || [])
+    .filter(s => typeof s === 'string' && s.trim().length > 0)
+    .slice(0, 10)
+    .map(scrubDashes);
+  const scrubbedHistorical = scrubDashes(out.historical_summary || parsedExisting.historical_summary || '');
+
   const newMemory = buildMemoryString({
-    historical_summary: out.historical_summary || parsedExisting.historical_summary,
-    recent_activity_lines: out.recent_activity_lines || []
+    historical_summary: scrubbedHistorical,
+    recent_activity_lines: cappedRecentLines
   });
 
   await writeContactCustomField(contactId, 'communication_memory', newMemory);

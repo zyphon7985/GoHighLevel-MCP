@@ -269,6 +269,17 @@ function formatTimelineEntry({ ts, direction, channel, summary }) {
   return `${timestamp} ${dir} ${ch}: ${sum}`;
 }
 
+// Replace em dashes and en dashes with safer punctuation. Defense-in-depth
+// safety net for the no-em-dashes-in-AI-output rule. The synthesis prompt
+// instructs the model to avoid them, but compliance is not 100% so we
+// scrub at the boundary too.
+//   " — " (parenthetical) -> ", "
+//   "—"   (no spaces)     -> ","
+function scrubDashes(s) {
+  if (typeof s !== 'string') return s;
+  return s.replace(/\s+[—–]\s+/g, ', ').replace(/[—–]/g, ',');
+}
+
 module.exports = {
   ANTHROPIC_API_URL,
   GHL_BASE_URL,
@@ -288,5 +299,6 @@ module.exports = {
   callAnthropicWithRetry,
   parseMemory,
   buildMemoryString,
-  formatTimelineEntry
+  formatTimelineEntry,
+  scrubDashes
 };
