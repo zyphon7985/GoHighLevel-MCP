@@ -665,7 +665,9 @@ function humanizeStage(stage) {
     case 'preflight': return 'Preflight (loading contact / idempotency check)';
     case 'research': return 'Stage 1 (Research)';
     case 'synthesis_or_classification_failure': return 'Stage 2 (Synthesis) or classification fell through to Failure brief';
-    case 'writeback': return 'Stage 3 (Writeback to GHL)';
+    case 'writeback': return 'Stage 3 (Writeback to GHL) — uncaught exception';
+    case 'writeback_partial_failure': return 'Stage 3 (Writeback to GHL) — partial failure (some writes succeeded, some failed)';
+    case 'brief_not_written': return 'Stage 3 (Writeback to GHL) — Pre-Call Brief note was not created';
     case 'pipeline': return 'Pipeline (uncaught exception)';
     case 'complete': return 'Complete (writeback failures present)';
     case 'unknown': default: return stage || 'Unknown';
@@ -686,29 +688,20 @@ function humanizeReason(reason) {
   if (/get_contact_failed/.test(reason)) {
     return 'Could not load the contact from GHL during preflight. Most likely a transient GHL API outage or an invalid contact ID. Detail: ' + reason;
   }
-  if (/research_deadline_exceeded/.test(reason)) {
-    return 'The research stage exceeded its time budget without calling emit_research_findings. Most likely the agent got stuck on slow scrapes or a heavy turn loop. Detail: ' + reason;
-  }
-  if (/research_ended_without_emit/.test(reason)) {
-    return 'The research agent ended its turn without calling emit_research_findings. The agent decided to stop without producing structured findings. Detail: ' + reason;
-  }
-  if (/max_research_turns_exceeded/.test(reason)) {
-    return 'The research agent hit the MAX_RESEARCH_TURNS=30 cap without calling emit_research_findings. Likely an infinite tool loop or the agent could not converge. Detail: ' + reason;
-  }
-  if (/synthesis_no_emit/.test(reason)) {
-    return 'The synthesis stage returned without calling emit_enrichment despite tool_choice forcing it. Almost always a model API anomaly. Detail: ' + reason;
-  }
-  if (/synthesis_failed/.test(reason)) {
-    return 'The synthesis Anthropic call failed (network, timeout, or API error). Detail: ' + reason;
+  if (/aborted/i.test(reason)) {
+    return 'The fetch was aborted (timeout or cancellation). Most often this is the Anthropic API call exceeding its per-turn timeout window. Detail: ' + reason;
   }
   if (/writeback_threw/.test(reason)) {
     return 'GHL writeback threw an uncaught exception. Most likely a GHL API outage or auth / payload issue. Detail: ' + reason;
   }
-  if (/synthesis_classified_as_failure/.test(reason)) {
-    return 'The synthesis stage classified the lead as Failure (insufficient data after fallback chain). A failure-template brief was written. Detail: ' + reason;
+  if (/writeback partial/.test(reason)) {
+    return 'GHL accepted some writes but rejected others. Detail: ' + reason;
   }
-  if (/unexpected_stop_reason/.test(reason)) {
-    return 'The research agent returned a stop_reason that the loop did not know how to handle. Detail: ' + reason;
+  if (/create_contact_note did not return a note_id/.test(reason)) {
+    return 'The GHL create_contact_note call returned without a note_id. The Pre-Call Brief was not persisted. Detail: ' + reason;
+  }
+  if (/brief fallback also failed to write/.test(reason)) {
+    return 'Both the synthesis path and the failure-brief fallback failed to write. Likely a GHL API outage. Detail: ' + reason;
   }
   return reason;
 }
@@ -1420,31 +1413,53 @@ async function runEnrichment(contactId) {
 
   const elapsedSeconds = ((Date.now() - startTime) / 1000).toFixed(1);
 
-  if (!research.ok || enrichment.classification === 'failure') {
+  // Outcome classification policy:
+  //   The pipeline succeeded if it delivered a Pre-Call Brief to GHL with
+  //   no writeback errors. Classification (customer / partner / low_fit /
+  //   failure) is just metadata — a Failure-template brief is still a
+  //   valid delivery; it gives the sales rep WHAT WE TRIED + manual
+  //   research next steps. The user's policy: only alert when the system
+  //   fails to deliver, not when the data was just thin.
+  //
+  //   This means:
+  //     - research.ok=false but brief landed via fallback path -> ok:true
+  //     - synthesis classified as failure but brief landed       -> ok:true
+  //     - any case where note_id is null or writeback had errors -> ok:false
+  const briefDelivered = writeback.note_id != null && (writeback.failures || []).length === 0;
+
+  if (briefDelivered) {
     return {
-      ok: false,
-      stage: research.ok ? 'synthesis_or_classification_failure' : 'research',
+      ok: true,
+      stage: 'complete',
       contactName,
-      error: research.ok ? `synthesis_classified_as_failure` : research.error,
       research_turns: research.turns,
-      writeback_failures: writeback.failures || [],
-      brief_written: writeback.note_id != null,
+      research_ok: research.ok,
+      research_error: research.ok ? null : research.error,
       classification: enrichment.classification,
+      icp_score: enrichment.icp_score,
+      icp_segment: enrichment.icp_segment,
+      confidence_level: enrichment.confidence_level,
+      note_id: writeback.note_id,
+      writeback_failures: [],
       elapsedSeconds
     };
   }
 
+  // Brief did NOT land (or writeback had failures). This is a real system
+  // problem the user needs to know about.
   return {
-    ok: writeback.ok,
-    stage: 'complete',
+    ok: false,
+    stage: writeback.note_id == null ? 'brief_not_written' : 'writeback_partial_failure',
     contactName,
+    error: writeback.note_id == null
+      ? (research.ok ? 'create_contact_note did not return a note_id' : `${research.error}; brief fallback also failed to write`)
+      : `writeback partial: ${(writeback.failures || []).join(' | ')}`,
     research_turns: research.turns,
-    classification: enrichment.classification,
-    icp_score: enrichment.icp_score,
-    icp_segment: enrichment.icp_segment,
-    confidence_level: enrichment.confidence_level,
-    note_id: writeback.note_id,
+    research_ok: research.ok,
+    research_error: research.ok ? null : research.error,
     writeback_failures: writeback.failures || [],
+    brief_written: writeback.note_id != null,
+    classification: enrichment.classification,
     elapsedSeconds
   };
 }
