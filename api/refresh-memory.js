@@ -36,6 +36,7 @@ const { waitUntil } = require('@vercel/functions');
 const {
   authOK,
   readBody,
+  getField,
   ghlGetContact,
   writeContactCustomField,
   readContactCustomField,
@@ -258,9 +259,21 @@ const handler = async (req, res) => {
     return;
   }
 
-  const { contactId, event_type } = body;
+  // GHL nests workflow Custom Data under a `customData` key. Use getField
+  // to read from either the top level or customData seamlessly.
+  const contactId = getField(body, 'contactId', 'contact_id');
+  const event_type = getField(body, 'event_type');
+  const message_text = getField(body, 'message_text');
+  const call_duration_seconds = getField(body, 'call_duration_seconds');
+  const metadata = getField(body, 'metadata');
+
   if (!contactId || !event_type) {
-    res.status(400).json({ error: 'Missing required fields: contactId, event_type' });
+    console.warn(`[refresh-memory] missing fields. body keys: ${Object.keys(body || {}).join(',')}; customData keys: ${Object.keys((body && body.customData) || {}).join(',')}`);
+    res.status(400).json({
+      error: 'Missing required fields: contactId, event_type',
+      received_top_level_keys: Object.keys(body || {}),
+      received_custom_data_keys: Object.keys((body && body.customData) || {})
+    });
     return;
   }
 
@@ -275,8 +288,11 @@ const handler = async (req, res) => {
     received_at: new Date().toISOString()
   });
 
+  // Build the normalized payload that refreshMemory expects.
+  const refreshPayload = { contactId, event_type, message_text, call_duration_seconds, metadata };
+
   waitUntil(
-    refreshMemory(body)
+    refreshMemory(refreshPayload)
       .then(async (result) => {
         console.log(`[refresh-memory] complete: ${JSON.stringify(result).substring(0, 600)}`);
         if (result.foundation_correction_needed) {

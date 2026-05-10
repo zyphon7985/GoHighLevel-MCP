@@ -98,6 +98,27 @@ async function readBody(req) {
   }
 }
 
+// Extract a field from a webhook payload, tolerant of GHL's nesting.
+//
+// GHL workflow webhooks send custom-data fields under a `customData` key,
+// while standard contact fields land at the top level. They also use
+// snake_case for some standard fields (contact_id) and camelCase for
+// others. This helper checks (in order):
+//   1. body.<key> (top level — if the caller hand-rolled the payload)
+//   2. body.customData.<key> (GHL standard custom-data nesting)
+//   3. body.<snake_case_alt> (e.g., contact_id) when an alt is provided
+function getField(body, key, snakeAlt) {
+  if (!body) return undefined;
+  if (body[key] !== undefined && body[key] !== null && body[key] !== '') return body[key];
+  if (body.customData && body.customData[key] !== undefined && body.customData[key] !== null && body.customData[key] !== '') {
+    return body.customData[key];
+  }
+  if (snakeAlt && body[snakeAlt] !== undefined && body[snakeAlt] !== null && body[snakeAlt] !== '') {
+    return body[snakeAlt];
+  }
+  return undefined;
+}
+
 // ─── Slack notification (only fires on hard delivery failures) ──────────────
 
 async function postFailureNotification({ source, contactId, contactName, reason, stage, timestamp }) {
@@ -261,6 +282,7 @@ module.exports = {
   writeContactCustomField,
   authOK,
   readBody,
+  getField,
   postFailureNotification,
   callAnthropic,
   callAnthropicWithRetry,

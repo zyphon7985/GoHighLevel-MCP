@@ -26,6 +26,7 @@
 const {
   authOK,
   readBody,
+  getField,
   ghlGetContact,
   writeContactCustomField,
   readContactCustomField,
@@ -72,9 +73,21 @@ const handler = async (req, res) => {
     return;
   }
 
-  const { contactId, event_type, summary } = body;
+  // GHL nests workflow Custom Data under a `customData` key. Use getField
+  // to read from either the top level or customData seamlessly.
+  const contactId = getField(body, 'contactId', 'contact_id');
+  const event_type = getField(body, 'event_type');
+  const summary = getField(body, 'summary');
+  const directionOverride = getField(body, 'direction');
+  const channelOverride = getField(body, 'channel');
+
   if (!contactId || !event_type || !summary) {
-    res.status(400).json({ error: 'Missing required fields: contactId, event_type, summary' });
+    console.warn(`[log-event] missing fields. body keys: ${Object.keys(body || {}).join(',')}; customData keys: ${Object.keys((body && body.customData) || {}).join(',')}`);
+    res.status(400).json({
+      error: 'Missing required fields: contactId, event_type, summary',
+      received_top_level_keys: Object.keys(body || {}),
+      received_custom_data_keys: Object.keys((body && body.customData) || {})
+    });
     return;
   }
 
@@ -88,8 +101,8 @@ const handler = async (req, res) => {
 
     // Build new entry
     const inferred = inferDirectionAndChannel(event_type);
-    const direction = (body.direction || inferred.direction).toUpperCase();
-    const channel = (body.channel || inferred.channel).toUpperCase();
+    const direction = (directionOverride || inferred.direction).toUpperCase();
+    const channel = (channelOverride || inferred.channel).toUpperCase();
     const newEntry = formatTimelineEntry({
       ts: new Date().toISOString().replace('T', ' ').substring(0, 16),
       direction,
