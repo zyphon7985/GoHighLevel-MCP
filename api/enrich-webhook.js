@@ -537,7 +537,11 @@ Steps to perform, in order:
 2. Compute the ICP score (0-100) and confidence level using the rubric in Phase 6 Steps 2 and 3. Apply the gatekeeper modifier and the geography "project footprint, not HQ" rule.
 3. Determine the ICP segment per Phase 6 Step 4 (e.g., "Primary - Civil/Construction", "Partner - Technology Vendor", "Low Fit - Property Management").
 4. Populate icp_scoring_breakdown with a one-line per-factor breakdown for the brief.
-5. Compute the 16 contact custom field values per the field mappings in Phase 6. Leave a field as empty string ("") if you cannot determine its value — Stage 3 will skip empties so existing GHL data is preserved. enrichment_date is set automatically by Stage 3; do not include it.
+5. Compute the 16 contact custom field values per the field mappings in Phase 6. Leave a field as empty string ("") if you cannot determine its value, Stage 3 will skip empties so existing GHL data is preserved. enrichment_date is set automatically by Stage 3; do not include it.
+
+   IMPORTANT field placement: icp_score and icp_segment go ONLY at the top level of emit_enrichment, NOT inside contact_fields. Stage 3 reads them from the top level when writing the contact custom fields. Do not also duplicate them inside contact_fields.
+
+   IMPORTANT for year_founded: omit the field entirely from contact_fields if you do not have a confirmed year. Do NOT set it to 0, that writes a literal "0" to GHL which displays as "Year Founded: 0".
 6. Compute business standard field values from discovered website / address / phone / description. Only include fields you confidently want to write. Stage 3 skips empties.
 7. If the research provided name_correction_candidates with medium-or-high confidence, populate name_corrections. Always apply Title Case fixes for all-lower or ALL-CAPS names.
 8. Generate the pre-call brief sections matching the classification:
@@ -709,7 +713,7 @@ function humanizeReason(reason) {
   return reason;
 }
 
-function buildNotificationPayload({ source, contactId, contactName, reason, stage, turns, timestamp }) {
+function buildNotificationPayload({ source, contactId, contactName, reason, stage, turns, timestamp, briefWritten, classification }) {
   const ghlLoc = process.env.GHL_LOCATION_ID;
   const contactUrl = ghlLoc
     ? `https://app.gohighlevel.com/v2/location/${ghlLoc}/contacts/detail/${contactId}`
@@ -727,13 +731,29 @@ function buildNotificationPayload({ source, contactId, contactName, reason, stag
   const reasonHuman = humanizeReason(reason);
   const displayName = contactName && contactName.trim() ? contactName.trim() : '(name unavailable)';
 
+  // Soft failure vs hard failure framing.
+  // Soft failure: synthesis classified the lead as Failure due to thin
+  //   data, but the Failure-template brief was written successfully.
+  //   The pipeline did its job; the alert is informational so the user
+  //   knows manual research is recommended.
+  // Hard failure: real system error (exception, timeout, missing brief).
+  //   This is the actionable case.
+  const isSoftFailure =
+    (stage === 'synthesis_or_classification_failure' && briefWritten === true)
+    || (classification === 'failure' && briefWritten === true);
+
+  const headline = isSoftFailure
+    ? '*Lead enriched as Failure-template brief* (manual research recommended, no system error)'
+    : '*Lead enrichment failed*';
+
   const lines = [
-    `${userMention ? userMention + ' — ' : ''}*Lead enrichment failed*`.trim(),
+    `${userMention ? userMention + ' — ' : ''}${headline}`.trim(),
     `*Contact:* ${displayName} (\`${contactId}\`)`,
     `*Stage:* ${stageHuman}`,
     `*Source:* ${sourceHuman}`,
     `*Reason:* ${reasonHuman}`
   ];
+  if (briefWritten === true) lines.push(`*Brief written:* yes (visible in the GHL contact timeline)`);
   if (turns != null) lines.push(`*Research turns:* ${turns}`);
   lines.push(`*Time:* ${timestamp}`);
   const linkParts = [];
@@ -743,7 +763,8 @@ function buildNotificationPayload({ source, contactId, contactName, reason, stag
 
   return {
     text: lines.join('\n'),
-    event: 'lead_enrichment_failed',
+    event: isSoftFailure ? 'lead_enriched_as_failure' : 'lead_enrichment_failed',
+    soft_failure: isSoftFailure,
     source,
     source_human: sourceHuman,
     stage,
@@ -752,6 +773,8 @@ function buildNotificationPayload({ source, contactId, contactName, reason, stag
     contact_name: contactName || null,
     reason,
     reason_human: reasonHuman,
+    classification: classification || null,
+    brief_written: briefWritten === true,
     turns,
     timestamp,
     contact_url: contactUrl,
@@ -1170,8 +1193,24 @@ async function writeContactFields({ contactId, enrichment, existingContactSource
   const cf = enrichment.contact_fields || {};
   const corr = enrichment.name_corrections || {};
 
-  // Build custom field values, with stage-injected fields appended.
-  const fieldValues = { ...cf, enrichment_date: today };
+  // Build custom field values. ICP Score and ICP Segment are top-level
+  // emit_enrichment outputs (not nested under contact_fields), so we
+  // explicitly merge them here. The schema doesn't list them under
+  // contact_fields to avoid redundancy, but every contact custom field
+  // write must include them.
+  const fieldValues = {
+    ...cf,
+    icp_score: enrichment.icp_score,
+    icp_segment: enrichment.icp_segment,
+    enrichment_date: today
+  };
+
+  // Skip year_founded = 0. The schema is integer, so the model uses 0
+  // as a "skip" sentinel when the year is unknown. Writing 0 to GHL
+  // displays as "Year Founded: 0" which is misleading.
+  if (fieldValues.year_founded === 0 || fieldValues.year_founded === '0') {
+    delete fieldValues.year_founded;
+  }
 
   // Preserve existing Contact Source if it has a value (skill rule).
   if (existingContactSource && fieldValues.contact_source) {
@@ -1482,7 +1521,9 @@ const handler = async (req, res) => {
         const reason = (result && result.error) || 'unknown';
         const stage = (result && result.stage) || 'unknown';
         const contactName = (result && result.contactName) || await fetchContactNameBestEffort(contactId);
-        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} name="${contactName || ''}" stage=${stage} reason=${reason}`);
+        const briefWritten = !!(result && result.brief_written);
+        const classification = result && result.classification;
+        console.error(`[ENRICHMENT_FAILURE] contact=${contactId} name="${contactName || ''}" stage=${stage} reason=${reason} briefWritten=${briefWritten}`);
         await postFailureNotification({
           source: 'returned_failure',
           contactId,
@@ -1490,7 +1531,9 @@ const handler = async (req, res) => {
           reason,
           stage,
           turns: result && result.research_turns,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
+          briefWritten,
+          classification
         });
       })
       .catch(async (err) => {
