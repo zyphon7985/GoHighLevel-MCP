@@ -52,8 +52,24 @@ const CONTACT_FIELDS = {
   enrichment_date: 'mKxoh4updlE5gTHn5rE4',
   enrichment_status: 'fWKopv1EoEk7w05xUbUZ',
   company_website: 'BYci9oLWTdYipwsuAzH3',
-  enrichment_source: 'pu7XXEeb8y0195Dj2V4S'
+  enrichment_source: 'pu7XXEeb8y0195Dj2V4S',
+  // AI outreach scaffolding (v1):
+  // - enrichment_foundation: stable identity / company / fit prose, populated
+  //   at enrichment time and re-populated only on full re-enrichment.
+  //   Read by GHL Voice AI / Conversation AI / Email AI as long-term context.
+  // - communication_memory: evolving conversation memory, initialized to a
+  //   sentinel here and updated by the v2 /refresh-memory webhook on
+  //   inbound events. Re-enrichment preserves existing memory.
+  enrichment_foundation: 'Jfz323wRZQj75V1UFmIj',
+  communication_memory: 'KVEJ8Dtw4frhx9Qik5bd'
 };
+
+// Sentinel value written to Communication Memory at first-time enrichment so
+// downstream AI prompts always see a structured, parseable string instead of
+// an empty field. The /refresh-memory webhook (v2) replaces this on the
+// first inbound event.
+const COMMUNICATION_MEMORY_SENTINEL =
+  'HISTORICAL SUMMARY:\n(none yet, first contact, no conversation history)\n\nRECENT ACTIVITY (newest first):\n(no events yet)';
 
 // ─── Skill content (re-embedded; v2.3) ─────────────────────────────────────
 // The lead-enrichment skill content, embedded as a JS string literal. Source
@@ -421,6 +437,10 @@ const EMIT_ENRICHMENT_TOOL = {
         type: 'string',
         description: 'Factor-by-factor breakdown text. Example: "Industry 35/35 (Construction); Geography 22/25 (FL projects); Decision Maker 15/15 (CEO); Company Size 12/15 (Small 11-50); Revenue 0/5 (Unknown); Digital Presence 5/5 (Full website)". Used by Stage 3 in the brief.'
       },
+      enrichment_foundation: {
+        type: 'string',
+        description: 'Stable identity-and-fit prose paragraph for downstream AI outreach (Voice AI, Conversation AI, Email AI). 100-150 words, plain prose, no emoji / bullets / em dashes / markdown. This is read by automated bots as long-term context for personalized outreach. It must be conservative: never invent details, anchor only on confirmed data, explicitly acknowledge unknowns. Use one of three shapes based on enrichment quality:\n\nShape A (full data, classification customer or partner with most ICP factors scored): Identity sentence (name, role, company, what the company does in one phrase). Lead source. Fit context (one sentence on why TerraGenie is relevant given their actual operations). One specific value-prop hook tied to their work.\n\nShape B (thin data, classification low_fit or sparse customer): Identity sentence with confirmed facts only. Lead source. Explicit acknowledgment of unknowns ("industry, services, and company size are unknown"). Direction to lead with discovery questions rather than specific value claims.\n\nShape C (failure classification, no enrichment data recovered): Begins with "Generic outreach context. No enrichment data available beyond name and lead source." Tells the bot to use the lead source as the warm hook and ask open discovery questions. Explicitly instructs the bot not to reference company, industry, or services since none are confirmed.\n\nDo not add headers, do not use the words "Shape A/B/C" in the output. Just the prose paragraph.'
+      },
       name_corrections: {
         type: 'object',
         description: 'Only include fields where there is medium-or-high confidence the GHL value is wrong. Stage 3 overwrites these via update_contact / update_business. Always apply Title Case fixes for all-lower or ALL-CAPS names.',
@@ -549,6 +569,17 @@ Steps to perform, in order:
    - partner: who, partner_partnership_potential, partner_referral_angle, optional partner_considerations, opening_angles[2-3], contact_info, optionally company
    - low_fit: who, company, lead_source, low_fit_icp_notes, low_fit_possible_angles, opening_angles[2-3], contact_info
    - failure: failure_what_we_know, failure_what_we_tried, failure_next_steps, opening_angles[2-3], who is optional
+
+9. Generate enrichment_foundation: a 100-150 word plain prose paragraph that downstream AI bots (Voice AI, Conversation AI, Email AI) will read as stable long-term context when reaching out to this lead. This is NOT the brief, it is a separate field. The brief is for human sales reps; the foundation is for bots. Bots will inject this paragraph directly into their personalization prompts via {{contact.enrichment_foundation}}.
+
+   Foundation rules (strict):
+   - 100-150 words maximum
+   - Plain prose only, no headers, no bullets, no em dashes, no markdown, no emoji
+   - Conservative: state only confirmed facts, never invent details, explicitly mark unknowns
+   - Three shapes per the schema description (Shape A full / Shape B thin / Shape C generic) — pick based on enrichment quality
+   - End with one sentence describing the angle the bot should lead with (description, not script)
+   - Do not include the contact's email, phone, or LinkedIn (the bot has those separately)
+   - Do not echo the icp_score, segment, or scoring breakdown (the bot does not need these)
 
 OPENING_ANGLES is MANDATORY for every classification, never empty. Provide 2-3 ready-to-use opening lines as separate array entries. DO NOT prefix entries with "1.", "2.", "3.", or any leading numbering, Stage 3 numbers them automatically when assembling the brief. Each array entry should start directly with the opener text or the leading quote. When data is thin (low confidence, sparse research), anchor openers on lead source, form responses, geography, or company name and explicitly note the limitation inside the array text.
 
@@ -1181,22 +1212,38 @@ function formatBrief(enrichment, { contactName, companyName }) {
 
 // ─── Stage 3: Writeback ────────────────────────────────────────────────────
 
-async function writeContactFields({ contactId, enrichment, existingContactSource }) {
+async function writeContactFields({ contactId, enrichment, existingContactSource, existingCommunicationMemory }) {
   const today = new Date().toISOString().slice(0, 10);
   const cf = enrichment.contact_fields || {};
   const corr = enrichment.name_corrections || {};
 
-  // Build custom field values. ICP Score and ICP Segment are top-level
-  // emit_enrichment outputs (not nested under contact_fields), so we
-  // explicitly merge them here. The schema doesn't list them under
-  // contact_fields to avoid redundancy, but every contact custom field
-  // write must include them.
+  // Build custom field values. ICP Score, ICP Segment, and the AI outreach
+  // foundation are top-level emit_enrichment outputs (not nested under
+  // contact_fields), so we explicitly merge them here. The schema doesn't
+  // list them under contact_fields to avoid redundancy, but every contact
+  // custom field write must include them.
   const fieldValues = {
     ...cf,
     icp_score: enrichment.icp_score,
     icp_segment: enrichment.icp_segment,
+    enrichment_foundation: enrichment.enrichment_foundation,
     enrichment_date: today
   };
+
+  // Communication Memory is initialized to a sentinel ONLY on first-time
+  // enrichment. If existing memory already contains real conversation data
+  // (anything that's not the sentinel), we preserve it across re-enrichments.
+  // The /refresh-memory webhook (v2) is the only thing that should mutate
+  // accumulated memory after first contact.
+  const memoryIsEmpty =
+    !existingCommunicationMemory ||
+    !String(existingCommunicationMemory).trim() ||
+    String(existingCommunicationMemory).trim() === COMMUNICATION_MEMORY_SENTINEL;
+  if (memoryIsEmpty) {
+    fieldValues.communication_memory = COMMUNICATION_MEMORY_SENTINEL;
+  }
+  // else: leave communication_memory out of the payload entirely so existing
+  // accumulated memory is preserved.
 
   // Skip year_founded = 0. The schema is integer, so the model uses 0
   // as a "skip" sentinel when the year is unknown. Writing 0 to GHL
@@ -1262,6 +1309,7 @@ async function runWriteback({ contactId, contactRecord, enrichment }) {
   const contact = (contactRecord && contactRecord.contact) || {};
   const businessId = contact.businessId || null;
   const existingContactSource = contact.source || null;
+  const existingCommunicationMemory = readContactCustomField(contactRecord, 'communication_memory');
   const corr = enrichment.name_corrections || {};
   const contactName = [
     corr.first_name || contact.firstName,
@@ -1273,7 +1321,7 @@ async function runWriteback({ contactId, contactRecord, enrichment }) {
   // does not block the others — collect results and downgrade status if any
   // failed.
   const [contactResult, businessResult, noteResult] = await Promise.allSettled([
-    writeContactFields({ contactId, enrichment, existingContactSource }),
+    writeContactFields({ contactId, enrichment, existingContactSource, existingCommunicationMemory }),
     writeBusinessFields({ businessId, enrichment }),
     createPreCallBriefNote({ contactId, enrichment, contactName, companyName })
   ]);
