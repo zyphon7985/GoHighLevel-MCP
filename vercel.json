@@ -4,11 +4,19 @@
   "buildCommand": "npm run build && mkdir -p public && echo 'OK' > public/_health.txt",
   "rewrites": [
     { "source": "/enrich-webhook", "destination": "/api/enrich-webhook" },
+    { "source": "/log-event", "destination": "/api/log-event" },
+    { "source": "/refresh-memory", "destination": "/api/refresh-memory" },
     { "source": "/(.*)", "destination": "/api/index" }
   ],
   "functions": {
     "api/enrich-webhook.js": {
       "maxDuration": 800
+    },
+    "api/log-event.js": {
+      "maxDuration": 30
+    },
+    "api/refresh-memory.js": {
+      "maxDuration": 180
     },
     "api/index.js": {
       "maxDuration": 60
