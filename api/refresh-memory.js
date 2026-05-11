@@ -43,6 +43,7 @@ const {
   parseMemory,
   buildMemoryString,
   scrubDashes,
+  formatLocalTimestamp,
   callAnthropicWithRetry,
   postFailureNotification
 } = require('./_shared');
@@ -220,7 +221,7 @@ async function refreshMemory({ contactId, event_type, message_text, call_duratio
     eventTextProcessed = await preSummarizeEventText(eventTextProcessed, event_type);
   }
 
-  const eventTimestamp = new Date().toISOString().replace('T', ' ').substring(0, 16);
+  const eventTimestamp = formatLocalTimestamp(new Date());
   const newEventBlock = {
     timestamp: eventTimestamp,
     event_type,

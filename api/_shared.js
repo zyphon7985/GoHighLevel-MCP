@@ -262,7 +262,7 @@ function buildMemoryString({ historical_summary, recent_activity_lines }) {
 //   channel: 'SMS' | 'EMAIL' | 'CALL' | 'BOT_SMS' | 'BOT_EMAIL' | etc.
 //   summary: brief text describing what happened
 function formatTimelineEntry({ ts, direction, channel, summary }) {
-  const timestamp = ts || new Date().toISOString().replace('T', ' ').substring(0, 16);
+  const timestamp = ts || formatLocalTimestamp(new Date());
   const dir = (direction || '').toUpperCase();
   const ch = (channel || '').toUpperCase();
   const sum = (summary || '').replace(/\n+/g, ' ').trim().substring(0, 220);
@@ -278,6 +278,33 @@ function formatTimelineEntry({ ts, direction, channel, summary }) {
 function scrubDashes(s) {
   if (typeof s !== 'string') return s;
   return s.replace(/\s+[—–]\s+/g, ', ').replace(/[—–]/g, ',');
+}
+
+// Format a Date as "YYYY-MM-DD HH:MM" in a specific timezone (default
+// America/New_York for Rob). Uses Intl.DateTimeFormat so DST is handled
+// automatically (EST <-> EDT). Vercel function runtime defaults to UTC,
+// which produced 14:04 in entries when Rob expected 10:04 (EDT). All
+// Recent Activity timestamps now use this helper instead of toISOString.
+//
+// Override via env TIMESTAMP_TIMEZONE if you want a different zone.
+function formatLocalTimestamp(date, tz) {
+  const d = date instanceof Date ? date : new Date();
+  const zone = tz || process.env.TIMESTAMP_TIMEZONE || 'America/New_York';
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: zone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).formatToParts(d).reduce((acc, p) => {
+    if (p.type !== 'literal') acc[p.type] = p.value;
+    return acc;
+  }, {});
+  // Intl can return "24" for midnight hour in en-US; normalize to "00".
+  const hour = parts.hour === '24' ? '00' : parts.hour;
+  return `${parts.year}-${parts.month}-${parts.day} ${hour}:${parts.minute}`;
 }
 
 module.exports = {
@@ -300,5 +327,6 @@ module.exports = {
   parseMemory,
   buildMemoryString,
   formatTimelineEntry,
+  formatLocalTimestamp,
   scrubDashes
 };

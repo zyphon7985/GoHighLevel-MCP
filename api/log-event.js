@@ -33,6 +33,7 @@ const {
   parseMemory,
   buildMemoryString,
   formatTimelineEntry,
+  formatLocalTimestamp,
   postFailureNotification
 } = require('./_shared');
 
@@ -104,7 +105,7 @@ const handler = async (req, res) => {
     const direction = (directionOverride || inferred.direction).toUpperCase();
     const channel = (channelOverride || inferred.channel).toUpperCase();
     const newEntry = formatTimelineEntry({
-      ts: new Date().toISOString().replace('T', ' ').substring(0, 16),
+      ts: formatLocalTimestamp(new Date()),
       direction,
       channel,
       summary
