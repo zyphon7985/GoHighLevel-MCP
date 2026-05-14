@@ -363,8 +363,11 @@ const handler = async (req, res) => {
         console.log(`[refresh-memory] complete: ${JSON.stringify(result).substring(0, 600)}`);
         if (result.foundation_correction_needed) {
           console.warn(`[refresh-memory] FOUNDATION CORRECTION NEEDED contact=${contactId} note="${result.foundation_correction_note}"`);
-          // Slack alert so Rob can decide whether to re-run enrichment
+          // Slack alert so Rob can decide whether to re-run enrichment.
+          // kind='attention' frames this as a soft signal (Memory wrote fine,
+          // Foundation may be stale) rather than a delivery failure.
           await postFailureNotification({
+            kind: 'attention',
             source: 'foundation_correction_needed',
             stage: 'memory-refresh',
             contactId,

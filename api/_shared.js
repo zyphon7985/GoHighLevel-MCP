@@ -119,9 +119,18 @@ function getField(body, key, snakeAlt) {
   return undefined;
 }
 
-// ─── Slack notification (only fires on hard delivery failures) ──────────────
-
-async function postFailureNotification({ source, contactId, contactName, reason, stage, timestamp }) {
+// ─── Slack notification ─────────────────────────────────────────────────────
+//
+// Two kinds of alerts go through this helper:
+//   - kind='failed'    → delivery failure (write blew up, network error, etc.)
+//                        Headline: "*<stage> failed*"
+//   - kind='attention' → soft signal that needs a human decision but is NOT a
+//                        delivery failure (e.g., foundation_correction_needed
+//                        — Memory wrote fine, but Foundation may be stale).
+//                        Headline: "*<stage> needs attention*"
+//
+// Default is 'failed' for backwards compatibility.
+async function postFailureNotification({ source, contactId, contactName, reason, stage, timestamp, kind }) {
   const url = process.env.NOTIFY_WEBHOOK_URL;
   if (!url) return;
   const ghlLoc = process.env.GHL_LOCATION_ID;
@@ -131,8 +140,10 @@ async function postFailureNotification({ source, contactId, contactName, reason,
   const logsUrl = `https://vercel.com/robvaniglia-gmailcoms-projects/go-high-level-mcp/logs?query=${encodeURIComponent(contactId)}`;
   const userMention = process.env.SLACK_NOTIFY_USER_ID ? `<@${process.env.SLACK_NOTIFY_USER_ID}>` : '';
   const displayName = (contactName && contactName.trim()) || '(name unavailable)';
+  const alertKind = kind === 'attention' ? 'attention' : 'failed';
+  const headlineSuffix = alertKind === 'attention' ? 'needs attention' : 'failed';
   const lines = [
-    `${userMention ? userMention + ' — ' : ''}*${stage} failed*`.trim(),
+    `${userMention ? userMention + ' — ' : ''}*${stage} ${headlineSuffix}*`.trim(),
     `*Contact:* ${displayName} (\`${contactId}\`)`,
     `*Source:* ${source}`,
     `*Reason:* ${reason}`,
@@ -143,9 +154,18 @@ async function postFailureNotification({ source, contactId, contactName, reason,
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: lines.join('\n'), event: `${stage.toLowerCase().replace(/\s+/g, '_')}_failed`, source, contact_id: contactId, contact_name: contactName || null, reason, timestamp })
+      body: JSON.stringify({
+        text: lines.join('\n'),
+        event: `${stage.toLowerCase().replace(/\s+/g, '_')}_${alertKind}`,
+        kind: alertKind,
+        source,
+        contact_id: contactId,
+        contact_name: contactName || null,
+        reason,
+        timestamp
+      })
     });
-    console.log(`[notify] posted status=${res.status}`);
+    console.log(`[notify] posted status=${res.status} kind=${alertKind}`);
   } catch (err) {
     console.error(`[notify] errored: ${err.message}`);
   }
