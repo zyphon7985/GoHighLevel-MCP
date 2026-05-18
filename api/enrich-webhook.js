@@ -20,6 +20,7 @@
 // idempotency guard.
 
 const { waitUntil } = require('@vercel/functions');
+const { getDriveFromTerraGenieHQ, driveTimeToD2DPoints } = require('./_maps');
 
 // ─── Config ────────────────────────────────────────────────────────────────
 const ANTHROPIC_API_URL = 'https://api.anthropic.com/v1/messages';
@@ -61,7 +62,14 @@ const CONTACT_FIELDS = {
   //   sentinel here and updated by the v2 /refresh-memory webhook on
   //   inbound events. Re-enrichment preserves existing memory.
   enrichment_foundation: 'Jfz323wRZQj75V1UFmIj',
-  communication_memory: 'KVEJ8Dtw4frhx9Qik5bd'
+  communication_memory: 'KVEJ8Dtw4frhx9Qik5bd',
+  // ICP recalibration v2 (2026-05-18): added a second ICP score tuned for
+  // door-to-door fit and a numerical drive time from the TerraGenie HQ
+  // (5322 Ridgeway Dr, Orlando, FL 32819) so the field is queryable in GHL
+  // for proximity filtering. Existing icp_score (huDhxJeTQwziNa1ieNhc) is
+  // now framed as the revenue/opportunity score with no geo weighting.
+  icp_score_d2d: 'KHLZ1Im8xxQG14EmE2sq',
+  est_drive_time_min: 'HOit2kktcIuYMJXx4vCG'
 };
 
 // Sentinel value written to Communication Memory at first-time enrichment so
@@ -412,6 +420,18 @@ const STAGE1_TOOLS = [
         research_summary: {
           type: 'string',
           description: '2-4 paragraph free-form synthesis of what was found. Stage 2 reads this when generating brief sections.'
+        },
+        hq_address: {
+          type: 'object',
+          description: 'Best available HQ / primary-office street address for the company. Used by the pipeline to compute driving distance from TerraGenie HQ (5322 Ridgeway Dr, Orlando, FL 32819) for the D2D ICP score. Prefer Apollo organization street+city+state, then Firecrawl contact-page address, then Sunbiz principal-place-of-business address, then any city/state hint from service_area. If you only have a city/state, populate full_address as e.g. "Tampa, FL"; partial is better than null.',
+          properties: {
+            full_address: {
+              type: 'string',
+              description: 'A single-string address suitable for geocoding. Examples: "1100 Crescent Lake Dr, Sanford, FL 32773" / "Downtown Tampa, FL" / "Jacksonville, FL". Leave empty if no geographic signal is available at all.'
+            },
+            confidence: { type: 'string', enum: ['high', 'medium', 'low', 'none'] },
+            source: { type: 'string', description: 'Which source the address came from: "apollo_org", "firecrawl_contact_page", "sunbiz", "google_maps", "service_area_inference", or "none".' }
+          }
         }
       },
       required: ['sufficient', 'classification_intent', 'contact_summary', 'sources_used', 'research_summary']
@@ -539,6 +559,8 @@ Tools NOT available:
 - Fullenrich tools — Stage 1 does not run Fullenrich. The skill default of OFF applies absolutely here.
 
 When you have enough data to confidently classify the lead AND score at least 3 of the 6 ICP factors, call emit_research_findings with the structured payload. Be thorough but bounded — once you have enough, stop researching and emit. Adaptive multi-source fallback is preserved: if Apollo org is empty or Firecrawl yields thin data, run the Phase 4b fallback chain (Sunbiz, Google Maps, LinkedIn) before emitting. Conditional sub-page scrapes (/about, /services, /our-work) are encouraged when the homepage is thin.
+
+REQUIRED: populate hq_address in emit_research_findings. Driving distance from TerraGenie HQ (5322 Ridgeway Dr, Orlando, FL 32819) is now the dominant factor in the D2D ICP score. Use the best available source for the company's HQ or primary office address (Apollo org street+city+state first, then Firecrawl contact page, then Sunbiz, then a city/state inference from service_area). If you only have city+state, that is still useful — set full_address to "City, ST" and source="service_area_inference" with confidence="low". Set confidence="none" only when there is genuinely no geographic signal at all.
 
 If you exhaust all sources and still cannot score 3 factors, set sufficient=false in the emit_research_findings payload and emit anyway. Stage 3 will produce a Failure brief.
 
@@ -949,9 +971,122 @@ async function runResearchLoop(contactId, deadline) {
   };
 }
 
+// ─── Drive time enrichment (between Stage 1 and Stage 2) ───────────────────
+
+// Resolve the best-known HQ address string from Stage 1 findings + business
+// record, in this priority order:
+//   1. findings.hq_address.full_address (the model's own best read)
+//   2. apollo_organization.{street, city, state, postal_code}
+//   3. business record address fields
+//   4. apollo_organization.{city, state} (city-level fallback)
+//   5. fallback_findings.sunbiz / google_maps free-text (last resort, just
+//      pass to the geocoder — it will fail cleanly if nothing parseable)
+// Returns { address, source, confidence } where confidence reflects the
+// resolution path, not the geocoder's match quality.
+function resolveHqAddress(findings, businessRecord) {
+  const business = (businessRecord && businessRecord.business) || businessRecord || null;
+
+  // 1. Stage 1's own choice (highest priority — the model saw everything)
+  const hq = (findings && findings.hq_address) || {};
+  if (hq.full_address && hq.full_address.trim()) {
+    return {
+      address: hq.full_address.trim(),
+      source: hq.source || 'stage1_emit',
+      confidence: hq.confidence || 'medium'
+    };
+  }
+
+  // 2. Apollo organization full street address
+  const apolloOrg = (findings && findings.apollo_organization) || {};
+  if (apolloOrg.street && apolloOrg.city && apolloOrg.state) {
+    const parts = [apolloOrg.street, apolloOrg.city, apolloOrg.state, apolloOrg.postal_code]
+      .filter(Boolean)
+      .join(', ');
+    return { address: parts, source: 'apollo_org_full', confidence: 'high' };
+  }
+
+  // 3. Business record
+  if (business && business.address && business.city && business.state) {
+    const parts = [business.address, business.city, business.state, business.postalCode]
+      .filter(Boolean)
+      .join(', ');
+    return { address: parts, source: 'ghl_business_full', confidence: 'high' };
+  }
+
+  // 4. Apollo org city-only fallback
+  if (apolloOrg.city && apolloOrg.state) {
+    return { address: `${apolloOrg.city}, ${apolloOrg.state}`, source: 'apollo_org_city', confidence: 'medium' };
+  }
+
+  // 5. Business record city-only fallback
+  if (business && business.city && business.state) {
+    return { address: `${business.city}, ${business.state}`, source: 'ghl_business_city', confidence: 'medium' };
+  }
+
+  // No usable geographic signal
+  return { address: null, source: 'none', confidence: 'none' };
+}
+
+// Compute drive time + distance + tier points from TerraGenie HQ. Returns
+// a small summary object that the synthesis stage receives via user message.
+// Returns null on any failure so synthesis falls back to geo-blind D2D
+// scoring (the synthesis prompt handles that case explicitly).
+async function computeDriveData(findings, businessRecord) {
+  const resolved = resolveHqAddress(findings, businessRecord);
+  if (!resolved.address) {
+    console.log('[drive-time] no usable HQ address, skipping ORS call');
+    return {
+      drive_time_minutes: null,
+      distance_miles: null,
+      d2d_points_from_distance: 0,
+      hq_address_resolved: null,
+      hq_address_source: resolved.source,
+      hq_address_confidence: resolved.confidence,
+      skipped_reason: 'no_address'
+    };
+  }
+  try {
+    const route = await getDriveFromTerraGenieHQ(resolved.address);
+    if (!route) {
+      console.log(`[drive-time] route lookup returned null for "${resolved.address}"`);
+      return {
+        drive_time_minutes: null,
+        distance_miles: null,
+        d2d_points_from_distance: 0,
+        hq_address_resolved: resolved.address,
+        hq_address_source: resolved.source,
+        hq_address_confidence: resolved.confidence,
+        skipped_reason: 'route_lookup_failed'
+      };
+    }
+    const points = driveTimeToD2DPoints(route.duration_minutes);
+    console.log(`[drive-time] "${resolved.address}" -> ${route.duration_minutes}min, ${route.distance_miles}mi, tier=${points}`);
+    return {
+      drive_time_minutes: route.duration_minutes,
+      distance_miles: route.distance_miles,
+      d2d_points_from_distance: points,
+      hq_address_resolved: resolved.address,
+      hq_address_source: resolved.source,
+      hq_address_confidence: resolved.confidence,
+      skipped_reason: null
+    };
+  } catch (err) {
+    console.warn(`[drive-time] threw: ${err.message}`);
+    return {
+      drive_time_minutes: null,
+      distance_miles: null,
+      d2d_points_from_distance: 0,
+      hq_address_resolved: resolved.address,
+      hq_address_source: resolved.source,
+      hq_address_confidence: resolved.confidence,
+      skipped_reason: `error: ${err.message}`
+    };
+  }
+}
+
 // ─── Stage 2: Synthesis ────────────────────────────────────────────────────
 
-async function synthesizeEnrichment({ findings, contactId, contactRecord, businessRecord }) {
+async function synthesizeEnrichment({ findings, contactId, contactRecord, businessRecord, driveData }) {
   console.log(`[synthesis] start contact=${contactId}`);
   const startTime = Date.now();
 
@@ -989,7 +1124,7 @@ async function synthesizeEnrichment({ findings, contactId, contactRecord, busine
     : null;
 
   const userMessage = [
-    'Here is the structured research payload from Stage 1, plus the current GHL contact and business records. Synthesize the complete enrichment per the skill rules and emit via emit_enrichment.',
+    'Here is the structured research payload from Stage 1, plus the current GHL contact and business records, plus the deterministically-computed driving distance from TerraGenie HQ. Synthesize the complete enrichment per the skill rules and emit via emit_enrichment.',
     '',
     '<research_findings>',
     JSON.stringify(findings, null, 2),
@@ -998,7 +1133,11 @@ async function synthesizeEnrichment({ findings, contactId, contactRecord, busine
     '<ghl_contact>',
     JSON.stringify(contactSnapshot, null, 2),
     '</ghl_contact>',
-    businessSnapshot ? `<ghl_business>\n${JSON.stringify(businessSnapshot, null, 2)}\n</ghl_business>` : '<ghl_business>none</ghl_business>'
+    businessSnapshot ? `<ghl_business>\n${JSON.stringify(businessSnapshot, null, 2)}\n</ghl_business>` : '<ghl_business>none</ghl_business>',
+    '',
+    '<drive_data>',
+    driveData ? JSON.stringify(driveData, null, 2) : '{ "drive_time_minutes": null, "skipped_reason": "drive_data_not_computed" }',
+    '</drive_data>'
   ].join('\n');
 
   const messages = [{ role: 'user', content: userMessage }];
@@ -1417,6 +1556,20 @@ async function runEnrichment(contactId) {
   const stageDeadline = ENRICHMENT_DEADLINE_MS - (Date.now() - startTime);
   const research = await runResearchLoop(contactId, Math.max(60_000, stageDeadline - 120_000));
 
+  // Between Stage 1 and Stage 2: compute driving distance from TerraGenie
+  // HQ to the company's resolved HQ address. Deterministic and cheap; failure
+  // here falls back to a null drive_data which synthesis handles by giving
+  // a geo-blind D2D score (0 distance points).
+  let driveData = null;
+  if (research.ok) {
+    try {
+      driveData = await computeDriveData(research.findings, businessRecord);
+    } catch (err) {
+      console.warn(`[enrich] driveData compute threw: ${err.message}`);
+      driveData = null;
+    }
+  }
+
   // Stage 2: synthesis (or failure-payload fallback).
   let enrichment;
   if (research.ok) {
@@ -1425,7 +1578,8 @@ async function runEnrichment(contactId) {
         findings: research.findings,
         contactId,
         contactRecord,
-        businessRecord
+        businessRecord,
+        driveData
       });
     } catch (err) {
       console.error(`[enrich] synthesis failed: ${err.message}`);
