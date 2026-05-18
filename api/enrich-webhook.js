@@ -1383,12 +1383,57 @@ function scrubDashes(s) {
   return s.replace(/\s+[—–]\s+/g, ', ').replace(/[—–]/g, ',');
 }
 
+// Format the POC Research section appended to the end of every customer /
+// low_fit / partner brief (skipped on failure briefs). Renders the lead-form
+// contact info plus the distilled decision-maker POCs from enrichment.poc_research.
+function formatPocResearchSection(enrichment, { contactName }) {
+  const pocs = Array.isArray(enrichment.poc_research) ? enrichment.poc_research : [];
+  const lines = [
+    '',
+    '================',
+    'POC RESEARCH',
+    '================',
+    '',
+    'PRIMARY CONTACT (lead form):',
+    `  Name:  ${contactName || 'Unknown'}`
+  ];
+  // The existing brief.contact_info block already carries the form contact's
+  // email/phone/LinkedIn. We keep the POC section purely additive (other
+  // decision-makers) to avoid duplication; reps can scroll up for the form
+  // contact's channels.
+  lines.push('  (Email/Phone/LinkedIn shown in CONTACT INFO above)');
+  lines.push('');
+
+  if (pocs.length === 0) {
+    lines.push('OTHER DECISION-MAKER POCs:');
+    lines.push('  No additional POCs surfaced by research. Try the company main line if listed on the website.');
+    return lines.join('\n');
+  }
+
+  lines.push(`OTHER DECISION-MAKER POCs (${pocs.length} found, for name-dropping when calling the main line):`);
+  pocs.forEach((p, idx) => {
+    lines.push('');
+    const title = p.title ? ` | ${p.title}` : '';
+    lines.push(`  ${idx + 1}. ${p.name || '(name missing)'}${title}`);
+    if (p.phone) lines.push(`     Phone:    ${p.phone}`);
+    if (p.email) lines.push(`     Email:    ${p.email}`);
+    if (p.linkedin_url) lines.push(`     LinkedIn: ${p.linkedin_url}`);
+    const meta = [p.source ? `Source: ${p.source}` : null, p.confidence ? `Confidence: ${p.confidence}` : null].filter(Boolean).join(' | ');
+    if (meta) lines.push(`     ${meta}`);
+    if (p.name_drop_hook && p.name_drop_hook.trim()) lines.push(`     Hook: ${p.name_drop_hook.trim()}`);
+  });
+
+  return lines.join('\n');
+}
+
 function formatBrief(enrichment, { contactName, companyName }) {
   const today = new Date().toISOString().slice(0, 10);
-  const score = enrichment.icp_score != null ? enrichment.icp_score : 0;
+  const scoreRevenue = enrichment.icp_score != null ? enrichment.icp_score : 0;
+  const scoreD2D = enrichment.icp_score_d2d != null ? enrichment.icp_score_d2d : 0;
   const confidence = enrichment.confidence_level || 'Very Low';
   const segment = enrichment.icp_segment || '';
   const classification = enrichment.classification || 'failure';
+  const driveTime = enrichment.est_drive_time_min;
   const brief = enrichment.brief || {};
   const angles = (brief.opening_angles || [])
     .map(stripLeadingNumbering)
@@ -1397,10 +1442,24 @@ function formatBrief(enrichment, { contactName, companyName }) {
 
   const headerLine1 = (header) => `${header} - ${contactName || 'Unknown Contact'} / ${companyName || 'Unknown Company'}`;
 
+  // Compact dual-score metadata line. Drive time is only included when known.
+  const driveSuffix = (driveTime != null && Number.isFinite(driveTime))
+    ? ` | Drive: ${Math.round(driveTime)}min from HQ`
+    : ' | Drive: unknown';
+  const scoresLine = `D2D Score: ${scoreD2D}/100 | Revenue Score: ${scoreRevenue}/100 (${confidence}) | Segment: ${segment}${driveSuffix}`;
+  const d2dBreakdownBlock = enrichment.icp_score_d2d_breakdown
+    ? `D2D SCORING: ${enrichment.icp_score_d2d_breakdown}`
+    : null;
+  const revBreakdownBlock = enrichment.icp_scoring_breakdown
+    ? `REVENUE SCORING: ${enrichment.icp_scoring_breakdown}`
+    : null;
+
+  const pocSection = (classification === 'failure') ? null : formatPocResearchSection(enrichment, { contactName });
+
   if (classification === 'partner') {
     const text = [
       headerLine1('🤝 PARTNER BRIEF'),
-      `Generated: ${today} | ICP Score: ${score}/100 (Partner Classification) | Segment: ${segment}`,
+      `Generated: ${today} | Partner Classification | Segment: ${segment}${driveSuffix}`,
       '',
       'WHO THEY ARE:',
       brief.who || '',
@@ -1415,7 +1474,8 @@ function formatBrief(enrichment, { contactName, companyName }) {
       '',
       'OPENING ANGLES:',
       angles,
-      ...(brief.contact_info ? ['', brief.contact_info] : [])
+      ...(brief.contact_info ? ['', brief.contact_info] : []),
+      ...(pocSection ? [pocSection] : [])
     ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
     return scrubDashes(text);
   }
@@ -1423,7 +1483,7 @@ function formatBrief(enrichment, { contactName, companyName }) {
   if (classification === 'low_fit') {
     const text = [
       headerLine1('🔍 AI ENRICHMENT PRE-CALL BRIEF'),
-      `Generated: ${today} | ICP Score: ${score}/100 (${confidence} Confidence) | Segment: ${segment}`,
+      `Generated: ${today} | ${scoresLine}`,
       '',
       'ℹ️ LOW ICP MATCH - SEE NOTES',
       '',
@@ -1442,8 +1502,10 @@ function formatBrief(enrichment, { contactName, companyName }) {
       '',
       'OPENING ANGLES:',
       angles,
-      ...(enrichment.icp_scoring_breakdown ? ['', `ICP SCORING BREAKDOWN: ${enrichment.icp_scoring_breakdown}`] : []),
-      ...(brief.contact_info ? ['', brief.contact_info] : [])
+      ...(d2dBreakdownBlock ? ['', d2dBreakdownBlock] : []),
+      ...(revBreakdownBlock ? [revBreakdownBlock] : []),
+      ...(brief.contact_info ? ['', brief.contact_info] : []),
+      ...(pocSection ? [pocSection] : [])
     ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
     return scrubDashes(text);
   }
@@ -1459,7 +1521,7 @@ function formatBrief(enrichment, { contactName, companyName }) {
       'WHAT WE TRIED:',
       brief.failure_what_we_tried || '',
       '',
-      `ICP SCORE: ${score}/100 (${confidence} Confidence) - score cannot be trusted due to insufficient data`,
+      `Scores: D2D ${scoreD2D}/100, Revenue ${scoreRevenue}/100 (${confidence}). Scores cannot be trusted due to insufficient data.`,
       '',
       'RECOMMENDED NEXT STEPS:',
       brief.failure_next_steps || '',
@@ -1471,13 +1533,22 @@ function formatBrief(enrichment, { contactName, companyName }) {
     return scrubDashes(text);
   }
 
-  // Default: customer
-  const customerHeader = score >= 90
-    ? '⭐⭐ TOP PRIORITY LEAD'
-    : (brief.header_flag || '');
+  // Default: customer. TOP PRIORITY now triggers on D2D score (not revenue)
+  // because Gal's near-term focus is door-knock motion. A massive revenue-
+  // potential lead that's too far / too enterprise should NOT get the
+  // top-priority flag for this sales cycle; it gets a high revenue score and
+  // a moderate D2D score, which is the correct signal.
+  let customerHeader;
+  if (scoreD2D >= 90) {
+    customerHeader = '⭐⭐ TOP PRIORITY D2D LEAD';
+  } else if (scoreRevenue >= 90 && scoreD2D < 70) {
+    customerHeader = '💎 HIGH REVENUE / LOW D2D - long sales cycle, plan accordingly';
+  } else {
+    customerHeader = brief.header_flag || '';
+  }
   const text = [
     headerLine1('🔍 AI ENRICHMENT PRE-CALL BRIEF'),
-    `Generated: ${today} | ICP Score: ${score}/100 (${confidence} Confidence) | Segment: ${segment}`,
+    `Generated: ${today} | ${scoresLine}`,
     ...(enrichment.engagement_signal ? [`Signal: ${enrichment.engagement_signal}`] : []),
     ...(customerHeader ? ['', customerHeader] : []),
     '',
@@ -1494,8 +1565,10 @@ function formatBrief(enrichment, { contactName, companyName }) {
     'OPENING ANGLES:',
     angles,
     ...(brief.customer_deal_size ? ['', `POTENTIAL DEAL SIZE: ${brief.customer_deal_size}`] : []),
-    ...(enrichment.icp_scoring_breakdown ? ['', `ICP SCORING BREAKDOWN: ${enrichment.icp_scoring_breakdown}`] : []),
-    ...(brief.contact_info ? ['', brief.contact_info] : [])
+    ...(d2dBreakdownBlock ? ['', d2dBreakdownBlock] : []),
+    ...(revBreakdownBlock ? [revBreakdownBlock] : []),
+    ...(brief.contact_info ? ['', brief.contact_info] : []),
+    ...(pocSection ? [pocSection] : [])
   ].filter(s => s !== undefined).join('\n').replace(/\n{3,}/g, '\n\n').trim();
   return scrubDashes(text);
 }
@@ -1507,18 +1580,27 @@ async function writeContactFields({ contactId, enrichment, existingContactSource
   const cf = enrichment.contact_fields || {};
   const corr = enrichment.name_corrections || {};
 
-  // Build custom field values. ICP Score, ICP Segment, and the AI outreach
-  // foundation are top-level emit_enrichment outputs (not nested under
-  // contact_fields), so we explicitly merge them here. The schema doesn't
-  // list them under contact_fields to avoid redundancy, but every contact
-  // custom field write must include them.
+  // Build custom field values. ICP Score (Revenue), ICP Score D2D, ICP Segment,
+  // Est Drive Time, and the AI outreach foundation are all top-level
+  // emit_enrichment outputs (not nested under contact_fields), so we
+  // explicitly merge them here. The schema doesn't list them under
+  // contact_fields to avoid redundancy, but every contact custom field
+  // write must include them.
   const fieldValues = {
     ...cf,
     icp_score: enrichment.icp_score,
+    icp_score_d2d: enrichment.icp_score_d2d,
     icp_segment: enrichment.icp_segment,
     enrichment_foundation: enrichment.enrichment_foundation,
     enrichment_date: today
   };
+
+  // est_drive_time_min: only write when synthesis emitted a value. Omit
+  // entirely if unavailable so GHL doesn't show "0 min" for contacts with
+  // no resolvable HQ address.
+  if (enrichment.est_drive_time_min != null && Number.isFinite(enrichment.est_drive_time_min)) {
+    fieldValues.est_drive_time_min = enrichment.est_drive_time_min;
+  }
 
   // Communication Memory is initialized to a sentinel ONLY on first-time
   // enrichment. If existing memory already contains real conversation data
