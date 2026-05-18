@@ -17,7 +17,8 @@ const GHL_API_VERSION = '2021-07-28';
 // update both here and in enrich-webhook.js.
 const CONTACT_FIELDS = {
   enrichment_foundation: 'Jfz323wRZQj75V1UFmIj',
-  communication_memory: 'KVEJ8Dtw4frhx9Qik5bd'
+  communication_memory: 'KVEJ8Dtw4frhx9Qik5bd',
+  icp_score_d2d: 'KHLZ1Im8xxQG14EmE2sq'
 };
 
 const COMMUNICATION_MEMORY_SENTINEL =
