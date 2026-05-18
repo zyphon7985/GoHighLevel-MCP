@@ -666,20 +666,22 @@ function buildSynthesisSystemPrompt() {
   return `You are running Stage 2 (Synthesis) of an automated lead-enrichment pipeline. Your input is a structured research payload from Stage 1. Your output is exactly ONE call to emit_enrichment with a complete structured enrichment object. You do NOT write to GHL — Stage 3 (function code) handles all writeback deterministically based on what you emit.
 
 Steps to perform, in order:
-1. Classify the lead per Phase 6 Step 1: customer, partner, low_fit, or failure. Use Stage 1's classification_intent as a starting point but refine if the data warrants it.
-2. Compute BOTH ICP scores (see "DUAL ICP SCORING" section below for the full rules):
+1. Classify: customer, partner, low_fit, or failure. Use Stage 1's classification_intent as the starting point; refine only if data warrants. (Skill Phase 6 has the classification gate detail; Stage 1 has already pre-classified.)
+2. Compute BOTH ICP scores per the "DUAL ICP SCORING" section:
    - icp_score: 0-100, REVENUE/OPPORTUNITY fit only, no geography weighting
-   - icp_score_d2d: 0-100, DOOR-TO-DOOR fit, dominated by driving distance + business-type taxonomy
-   Apply confidence_level to the lower of the two.
-3. Determine the ICP segment per Phase 6 Step 4 (e.g., "Primary - Civil/Construction", "Partner - Technology Vendor", "Low Fit - Property Management").
-4. Populate icp_scoring_breakdown (revenue) AND icp_score_d2d_breakdown (D2D) with one-line per-factor explanations for the brief.
-5. Echo est_drive_time_min from drive_data.drive_time_minutes (rounded to integer). Omit if drive_data.drive_time_minutes is null.
-6. Distill poc_research from findings.pocs (see "POC DISTILLATION" section).
-7. Compute the contact custom field values per the field mappings in Phase 6. Leave a field as empty string ("") if you cannot determine its value, Stage 3 will skip empties so existing GHL data is preserved. enrichment_date is set automatically by Stage 3; do not include it.
+   - icp_score_d2d: 0-100, DOOR-TO-DOOR fit, geo-dominant
+   Then set confidence_level (High / Medium / Low / Very Low) to reflect the WEAKER of the two scores' supporting data. Important: confidence_level is a SEPARATE METADATA FIELD; it does NOT discount either score number. Score numbers are pure formula results.
+3. Set icp_segment using the dash form (e.g., "Primary - Civil/Construction", "Partner - Technology Vendor", "Low Fit - Property Management"). Self-performing GC rule: if the company runs a self-performing construction division (their own in-house crews build the sites), classify as Primary - Civil/Construction regardless of corporate parent's headline industry. The self-performing division IS a construction GC, and that is what matters for TerraGenie.
+4. Populate icp_scoring_breakdown (revenue) AND icp_score_d2d_breakdown (D2D) with one-line per-factor explanations.
+5. Echo est_drive_time_min = drive_data.drive_time_minutes (rounded to integer). Omit entirely if drive_data.drive_time_minutes is null. Do NOT emit 0.
+6. Distill poc_research from findings.pocs per the "POC DISTILLATION" section.
+7. Compute contact_fields values. Empty string ("") on any field you cannot determine; Stage 3 skips empties so existing GHL data is preserved. enrichment_date is set by Stage 3.
 
-   IMPORTANT field placement: icp_score, icp_score_d2d, icp_segment, est_drive_time_min go ONLY at the top level of emit_enrichment, NOT inside contact_fields. Stage 3 reads them from the top level. Do not also duplicate them inside contact_fields.
+   FIELD PLACEMENT: icp_score, icp_score_d2d, icp_segment, est_drive_time_min are TOP-LEVEL on emit_enrichment, NOT under contact_fields.
 
-   IMPORTANT for year_founded: omit the field entirely from contact_fields if you do not have a confirmed year. Do NOT set it to 0, that writes a literal "0" to GHL which displays as "Year Founded: 0".
+   year_founded: omit entirely if no confirmed year. Never emit 0 (displays as "Year Founded: 0" in GHL).
+
+8. Compute business_fields, name_corrections, and brief sections per classification, then generate enrichment_foundation per its schema description.
 
 DUAL ICP SCORING (added 2026-05-18 — supersedes any single-score guidance in the skill):
 
@@ -750,43 +752,23 @@ B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
      drive_points = 35
      icp_score_d2d = clamp(48 + 35, 0, 100) = 83
 
-   Worked example C (drive_data unavailable):
-     drive_data = { drive_time_minutes: null, d2d_points_from_distance: 0, skipped_reason: "no_address" }
-     Treat drive_points = 0 (NOT -20). Append "drive time unavailable, geo-blind D2D score" to icp_score_d2d_breakdown.
-     Omit est_drive_time_min from emit_enrichment entirely (do NOT emit 0).
+   When drive_data is unavailable (skipped_reason non-null): drive_points = 0 (NOT -20). Add "drive time unavailable, geo-blind D2D score" to icp_score_d2d_breakdown. Omit est_drive_time_min entirely from emit_enrichment.
 
-ABSOLUTE FORMULA DISCIPLINE (CRITICAL — read this twice):
+ABSOLUTE FORMULA DISCIPLINE (CRITICAL):
 
-  The NUMBER you emit for icp_score_d2d MUST exactly equal:
-    clamp((base_fit_volume + base_fit_dm + base_fit_complexity) × multiplier + drive_data.d2d_points_from_distance, 0, 100)
+  Emitted icp_score_d2d MUST equal:
+    clamp((volume_pts + dm_pts + complexity_pts) × multiplier + drive_data.d2d_points_from_distance, 0, 100)
 
-  No exceptions. Not when drive_data failed. Not when the company is in your calibration ground truth. Not when you "know" the right answer is higher. The number is the formula result, period.
+  No exceptions. Not when drive_data failed. Not when the company is in your calibration ground truth. Not when you "know" the right answer is higher. Not because of confidence_level. The number is the formula result.
 
-  drive_data.d2d_points_from_distance IS THE DRIVE COMPONENT. You read it verbatim. You never substitute your own derived value, even when the pipeline reports skipped_reason. If drive_data shows skipped_reason="geocode_failed" or "ors_route_failed", the drive component is 0 (as provided). The resulting D2D score will be lower than the "true" geographic score. THIS IS THE INTENDED BEHAVIOR — a geo-blind score is a signal to the human reviewer that drive data is missing for this contact. The fix is upstream (better address detection or geocoding); it is NOT for synthesis to compensate.
+  drive_data.d2d_points_from_distance is the drive component, read verbatim. If drive_data.skipped_reason is non-null, drive_points = 0 and the D2D score will be lower than the "true" geographic score — that is the INTENDED behavior, signaling missing drive data to the human reviewer. Express your judgment about what the score "would be" with drive resolved only in icp_score_d2d_breakdown TEXT, never in the NUMBER.
 
-  You CAN and SHOULD express your judgment about what the score "would be" if drive resolved — but ONLY in the icp_score_d2d_breakdown TEXT field. Never in the icp_score_d2d NUMBER.
+  WRONG: Strict formula = 53. Model emits 83 with breakdown "True score likely 83+ if drive confirmed." Forbidden.
+  CORRECT: Strict formula = 53. Model emits 53 with breakdown "Drive component 0 (geocode_failed). Strict score 53. If drive had resolved (~24 min, +35 tier), strict score would be 88. Treat 53 as a floor."
 
-  WRONG (synthesis overriding the number — this is what happened on the prior calibration run):
-    Strict formula = 53. Model emits icp_score_d2d = 83 with breakdown "True D2D score likely 83+ if drive confirmed."
-    This is forbidden. The reviewer sees 83 and trusts it; they have no idea the formula said 53.
+  If your strict result feels far off the calibration band, re-examine FACTOR INPUTS (volume, DM, complexity, multiplier) within their legitimate ranges and recompute. NEVER patch the output.
 
-  CORRECT (synthesis emitting the formula result, explaining context in text):
-    Strict formula = 53. Model emits icp_score_d2d = 53 with breakdown "Drive component 0 (geocode_failed for company HQ address). Strict score 53. NOTE: company HQ is in Ocoee, FL, ~24 min from TerraGenie HQ; if drive had resolved, +35 tier would have applied bringing strict score to 88. Reviewer may treat 53 as a floor."
-    Now the reviewer sees the conservative 53, the breakdown explains exactly why and what the upside is, and the geo-blind state is transparent.
-
-  WRONG (output-tuning to land in calibration band):
-    Strict formula = 8. Model emits icp_score_d2d = 36 with breakdown "Calibration ground truth shows enterprise GCs in 35-55 band, adjusting to 36."
-    Forbidden. If your factors produced 8 for a company you believe should be 35-55, your factors are wrong, not your output.
-
-  CORRECT (re-examining factor inputs when the result feels off):
-    Strict formula = 8 for Hillpointe seems too low. Volume signal at 10/30 is too low — Hillpointe actively builds 5000+ units annually, that's high volume even though D2D-unfriendly. Re-rate volume to 18/30. New base = 36. 36 × 0.30 = 10.8 → 11. + 35 drive = 46. Emit 46.
-
-  Pre-flight check before emitting:
-    1. Did I compute base_fit_volume + base_fit_dm + base_fit_complexity? (these three sum to layer-1 base)
-    2. Did I apply ONE business-type multiplier? (not stacked, just one)
-    3. Did I add drive_data.d2d_points_from_distance VERBATIM? (not derived)
-    4. Did I clamp to 0-100?
-    5. Does my emitted number match the math? If not, FIX THE NUMBER, not the math.
+  Pre-flight: (1) layer-1 = sum of 3 factor pts. (2) Apply ONE multiplier. (3) Add drive_data.d2d_points_from_distance VERBATIM. (4) Clamp 0-100. (5) Emit the math result, not your gut feel.
 
 CALIBRATION GROUND-TRUTH (use these to CHECK your factor inputs, not to override your output):
   Ideal D2D, expected D2D 85-100, Revenue 70-90:
@@ -799,50 +781,29 @@ CALIBRATION GROUND-TRUTH (use these to CHECK your factor inputs, not to override
 
   How to use calibration: after you compute icp_score_d2d strictly, glance at the band for the company shape. If your result is FAR outside the expected band (e.g. enterprise GC scored 90, sweet-spot builder scored 30), that's a signal your FACTOR INPUTS need re-examination. Re-do the math with adjusted factor values. Never patch the output by adding arbitrary points.
 
-POC DISTILLATION:
-findings.pocs contains raw POC candidates from Stage 1 research. Distill into the final poc_research array (max 3):
-  - Deduplicate (same person mentioned by multiple sources merges into one entry, source becomes a comma-separated list).
-  - Drop confidence=low entries UNLESS the company is very small AND these are the only names available (a low-confidence owner name is still useful for name-dropping at a 5-person shop).
-  - Preserve phone, email, linkedin_url verbatim from the raw findings — do not invent or modify.
-  - Order entries by seniority: Owner / Principal / President / CEO first, then VP / Director / GM / COO, then ops/field leadership.
-  - Skip the lead-form contact themselves (they live separately in the brief's contact_info section).
-  - For each POC, write a useful 1-line name_drop_hook if Stage 1 surfaced any specific context (recent press, co-founder relationship, public quote, alma mater, prior employer overlap with TerraGenie team). Empty string if no specific hook is available; do not fabricate hooks.
-  - If findings.pocs is empty or returns no POCs that pass the gate, emit poc_research as an empty array. Stage 3 will render a "no additional POCs found" note in the brief.
-6. Compute business standard field values from discovered website / address / phone / description. Only include fields you confidently want to write. Stage 3 skips empties.
-7. If the research provided name_correction_candidates with medium-or-high confidence, populate name_corrections. Always apply Title Case fixes for all-lower or ALL-CAPS names.
-8. Generate the pre-call brief sections matching the classification:
-   - customer: who, company, lead_source, customer_why_fits, opening_angles[2-3], optional customer_deal_size, contact_info, optional header_flag
-   - partner: who, partner_partnership_potential, partner_referral_angle, optional partner_considerations, opening_angles[2-3], contact_info, optionally company
-   - low_fit: who, company, lead_source, low_fit_icp_notes, low_fit_possible_angles, opening_angles[2-3], contact_info
-   - failure: failure_what_we_know, failure_what_we_tried, failure_next_steps, opening_angles[2-3], who is optional
+POC DISTILLATION (findings.pocs → poc_research, max 3):
+  - Deduplicate same person across sources; merge sources into comma-separated list.
+  - Drop confidence=low UNLESS company is very small and these are the only names.
+  - Preserve phone/email/linkedin_url verbatim. Skip the lead-form contact.
+  - Order by seniority: Owner/Principal/President/CEO > VP/Director/GM/COO > ops/field.
+  - name_drop_hook only when Stage 1 surfaced specific context (press, co-founder relationship, alma mater, prior employer overlap). Empty string otherwise — do not fabricate.
+  - Empty array if no POC passes the gate.
 
-9. Generate enrichment_foundation: a plain prose paragraph that downstream AI bots (Voice AI, Conversation AI, Email AI) will read as stable long-term context when reaching out to this lead. Bots inject this verbatim via {{contact.enrichment_foundation}}, so accuracy and posture matter. This is NOT the brief; the brief is for humans, the foundation is for bots.
+BRIEF SECTIONS (by classification):
+  - customer: who, company, lead_source, customer_why_fits, opening_angles[2-3], optional customer_deal_size + contact_info + header_flag
+  - partner: who, partner_partnership_potential, partner_referral_angle, optional partner_considerations + company, opening_angles[2-3], contact_info
+  - low_fit: who, company, lead_source, low_fit_icp_notes, low_fit_possible_angles, opening_angles[2-3], contact_info
+  - failure: failure_what_we_know, failure_what_we_tried, failure_next_steps, opening_angles[2-3], optional who
 
-   Foundation rules (read the full schema description for enrichment_foundation first, it has the binding examples):
-   - DECIDE TIER FIRST: Tier A (high confidence, ICP 5+/6 factors scored, identity verified, services confirmed primary) / Tier B (mixed: company verified but identity partial OR services secondary-only OR ICP < 50 OR low_fit) / Tier C (failure or no usable data).
-   - LENGTH: Tier A 100-150 words. Tier B 60-100 words. Tier C 40-60 words. Shorter is better than speculative.
-   - NEVER name the contact when last name is missing, equals first name (e.g., "Dave Dave"), or is contradicted across sources. Use "the contact" / "the company contact".
-   - NEVER name third parties from public records (registered agents, managing members, BBB-listed owners). Bots care about THIS contact.
-   - NEVER state specific industry sub-segments ("residential remodeling", "commercial paving", "underground utilities") unless confirmed by primary source (the company's own website services page or LinkedIn). Secondary sources (BBB, BuildZoom, permits) are signal, not confirmation.
-   - NEVER recommend specific pitch angles in Tier B/C. Close with "Lead with open discovery" or equivalent generic direction. Do not pre-pitch verticals the contact has not confirmed.
-   - Plain prose only, no headers, no bullets, no em dashes, no markdown, no emoji.
-   - Do not include contact's email, phone, or LinkedIn (bot has those separately).
-   - Do not echo icp_score, segment, or scoring breakdown (bot does not need these).
-   - The schema description contains a worked correct-vs-incorrect example. Match the correct one's posture.
+OPENING_ANGLES is MANDATORY for every classification (2-3 entries). Do NOT prefix with "1." / "2." — Stage 3 numbers them. When data is thin, anchor on lead source / form responses / geography / company name and note the limitation. Section content is plain prose: no emoji headers, no "WHO HE/SHE IS:" prefixes, no section labels (Stage 3 wraps the template).
 
-OPENING_ANGLES is MANDATORY for every classification, never empty. Provide 2-3 ready-to-use opening lines as separate array entries. DO NOT prefix entries with "1.", "2.", "3.", or any leading numbering, Stage 3 numbers them automatically when assembling the brief. Each array entry should start directly with the opener text or the leading quote. When data is thin (low confidence, sparse research), anchor openers on lead source, form responses, geography, or company name and explicitly note the limitation inside the array text.
+ENRICHMENT_FOUNDATION: follow the schema description, which contains the binding TIER A/B/C definitions, length bands (A 100-150 / B 60-100 / C 40-60 words), no-name-when-unverified rule, no-third-parties rule, no-specific-pitch-in-B-or-C rule, no-sub-segment-without-primary-source rule, and a worked correct-vs-incorrect example. Plain prose only.
 
-Section content is plain prose. Do not include emoji headers, "WHO HE/SHE IS:" prefixes, or section labels. Stage 3 wraps content with the appropriate template scaffolding based on classification.
+WRITING STYLE: no em dashes (—) or en dashes (–) anywhere in any field. Use commas, periods, semicolons, parens, or restructure. Hyphens (-) are fine for compound modifiers (design-build, ground-up, mid-market).
+  WRONG: "Apollo seniority tag — manager — likely undersells real authority."
+  RIGHT: "Apollo seniority tag (manager) likely undersells real authority."
 
-WRITING STYLE, ABSOLUTE RULE: do not use em dashes (—) or en dashes (–) anywhere in any field of emit_enrichment. This includes brief sections (who, company, why_fits, opening_angles, etc.), icp_segment, icp_scoring_breakdown, engagement_signal, contact_info, name_corrections, and every other string. Use commas, periods, semicolons, parentheses, or restructure the sentence. Hyphens (-) are fine for compound modifiers like "design-build", "ground-up", or "mid-market". Examples of the rewrite:
-- WRONG: "He runs the field, not just the office — every quote goes through him."
-- RIGHT: "He runs the field, not just the office. Every quote goes through him."
-- WRONG: "Apollo seniority tag — manager — likely undersells real authority."
-- RIGHT: "Apollo seniority tag (manager) likely undersells real authority."
-- WRONG: "Segment: Primary — Civil/Construction"
-- RIGHT: "Segment: Primary - Civil/Construction"
-
-Do not call any other tools. emit_enrichment is your only valid output. Call it exactly once.
+emit_enrichment is your only valid output. Call it exactly once.
 
 ---
 
