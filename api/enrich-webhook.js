@@ -432,6 +432,24 @@ const STAGE1_TOOLS = [
             confidence: { type: 'string', enum: ['high', 'medium', 'low', 'none'] },
             source: { type: 'string', description: 'Which source the address came from: "apollo_org", "firecrawl_contact_page", "sunbiz", "google_maps", "service_area_inference", or "none".' }
           }
+        },
+        pocs: {
+          type: 'array',
+          description: 'Decision-maker POCs (Points of Contact) discovered for THIS company beyond the lead form contact. Sales reps use these to name-drop when calling the company main line and the form contact does not pick up. Target 2-3 senior decision-makers (owner, principal, president, CEO, VP, GM, COO, head of operations, head of field, controller). Skip junior staff. Skip the lead-form contact themselves (they are handled separately). Only include people with at least one actionable channel (phone, email, or LinkedIn) AND medium-or-high confidence in their role at this company. Better to return 0 high-confidence POCs than 5 speculative ones — Stage 2 will surface what you find.',
+          items: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Full name. Title Case.' },
+              title: { type: 'string', description: 'Role / title at this company. Be specific: "Owner", "President", "VP Field Operations", "Director of Survey", "Co-Founder", "Operations Manager", "General Manager". Avoid vague titles like "Manager".' },
+              phone: { type: 'string', description: 'Direct phone / mobile if found. Include extension if known. Empty string if not found.' },
+              email: { type: 'string', description: 'Direct email if found. Empty string if not found.' },
+              linkedin_url: { type: 'string', description: 'LinkedIn profile URL if found. Empty string if not found.' },
+              source: { type: 'string', description: 'Where the POC was discovered: "apollo_people_match", "firecrawl_leadership_page", "firecrawl_about_page", "firecrawl_contact_page", "google_search_owner", "sunbiz_officers", "linkedin_search", or a combination like "apollo+firecrawl".' },
+              confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: 'high: name+title+at-least-two-actionable-channels verified across 2+ sources. medium: name+title verified with at least one actionable channel from 1 reliable source. low: name+title only, no actionable channel — usually skip unless company is small and these are the only names available.' },
+              note: { type: 'string', description: 'Optional 1-line context Gal can use when name-dropping: prior employer overlap, alma mater, recent press, public quote, anything that builds rapport. Leave empty if no signal.' }
+            },
+            required: ['name', 'title', 'source', 'confidence']
+          }
         }
       },
       required: ['sufficient', 'classification_intent', 'contact_summary', 'sources_used', 'research_summary']
@@ -561,6 +579,24 @@ Tools NOT available:
 When you have enough data to confidently classify the lead AND score at least 3 of the 6 ICP factors, call emit_research_findings with the structured payload. Be thorough but bounded — once you have enough, stop researching and emit. Adaptive multi-source fallback is preserved: if Apollo org is empty or Firecrawl yields thin data, run the Phase 4b fallback chain (Sunbiz, Google Maps, LinkedIn) before emitting. Conditional sub-page scrapes (/about, /services, /our-work) are encouraged when the homepage is thin.
 
 REQUIRED: populate hq_address in emit_research_findings. Driving distance from TerraGenie HQ (5322 Ridgeway Dr, Orlando, FL 32819) is now the dominant factor in the D2D ICP score. Use the best available source for the company's HQ or primary office address (Apollo org street+city+state first, then Firecrawl contact page, then Sunbiz, then a city/state inference from service_area). If you only have city+state, that is still useful — set full_address to "City, ST" and source="service_area_inference" with confidence="low". Set confidence="none" only when there is genuinely no geographic signal at all.
+
+POC RESEARCH (NEW): in addition to enriching the lead-form contact, hunt for 2-3 OTHER decision-makers at the same company so the sales rep can name-drop when calling the company main line. Populate the pocs[] array in emit_research_findings. Target senior decision-makers only: Owner / Principal / President / CEO / Co-Founder / VP / GM / COO / Head of Operations / Head of Field / Director of Survey / Controller. Skip junior staff and individual contributors.
+
+Practical POC discovery strategy (apply in this order, stop when you have 2-3 solid POCs):
+  1. Firecrawl scrape the company's leadership / about / team / our-people pages if they exist (look at the homepage navigation for likely URLs).
+  2. Firecrawl scrape the company's contact / contact-us page (often lists key people).
+  3. Firecrawl search "<company name> owner" / "<company name> president" / "<company name> founder" — surfaces press, BBB, BuildZoom, news pages with names.
+  4. If Sunbiz returned officers/directors and the company is small (Florida LLC, sole owner), those officer names are usually the actual decision-makers — include them.
+  5. If Apollo organization data was retrieved, organization.contacts (when present) may list senior people.
+  6. For each candidate name, decide whether to spend an apollo_people_match call to verify role and pull contact channels. Worth it for 1-3 likely owners. Not worth it for every junior employee.
+
+POC inclusion gate:
+  - Include in pocs[] ONLY if (a) role is senior-decision-maker per the list above AND (b) you can attest at least medium confidence in their current role at THIS company AND (c) you have at least one actionable channel (phone, email, or LinkedIn) OR the company is small enough that even a name-only POC is useful for name-dropping.
+  - DO NOT pad the list with low-confidence names just to hit 2-3. Better to return 1 high-confidence POC than 3 speculative ones.
+  - Skip the lead-form contact themselves — they are already in the brief.
+  - Skip people clearly listed as "former" or who left the company per LinkedIn or news.
+
+Time budget: spend at most 4-5 turns on POC research for the whole batch. Diminishing returns past 3 solid POCs.
 
 If you exhaust all sources and still cannot score 3 factors, set sufficient=false in the emit_research_findings payload and emit anyway. Stage 3 will produce a Failure brief.
 
