@@ -756,12 +756,37 @@ B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
      Omit est_drive_time_min from emit_enrichment entirely (do NOT emit 0).
 
 ABSOLUTE FORMULA DISCIPLINE (CRITICAL — read this twice):
-  Your emitted icp_score_d2d MUST equal the strict formula result with the factor values you chose. Do not adjust the final number to "land in a calibration band". If your strict-formula result is 8 and you think the answer should be 36, that means one of your FACTOR VALUES is wrong — go back and reconsider volume signal, DM accessibility, operational complexity, or the multiplier. Adjust those factor values within their legitimate ranges (don't push values past their natural bounds either), then recompute. Emit the recomputed strict result.
 
-  WRONG (model fudging):
-    "Strict formula gives 8 but calibration says 36, so I'll emit 36."
-  RIGHT (model re-examining inputs):
-    "Strict formula gives 8 which is too low. Volume signal at 10/30 seems low for an enterprise GC actively building 5000 units/year — that's high volume even if D2D-unfriendly. Bumping volume to 18/30. New base = 28+8 = 36. 36×0.30 = 11. + 35 drive = 46. Emit 46."
+  The NUMBER you emit for icp_score_d2d MUST exactly equal:
+    clamp((base_fit_volume + base_fit_dm + base_fit_complexity) × multiplier + drive_data.d2d_points_from_distance, 0, 100)
+
+  No exceptions. Not when drive_data failed. Not when the company is in your calibration ground truth. Not when you "know" the right answer is higher. The number is the formula result, period.
+
+  drive_data.d2d_points_from_distance IS THE DRIVE COMPONENT. You read it verbatim. You never substitute your own derived value, even when the pipeline reports skipped_reason. If drive_data shows skipped_reason="geocode_failed" or "ors_route_failed", the drive component is 0 (as provided). The resulting D2D score will be lower than the "true" geographic score. THIS IS THE INTENDED BEHAVIOR — a geo-blind score is a signal to the human reviewer that drive data is missing for this contact. The fix is upstream (better address detection or geocoding); it is NOT for synthesis to compensate.
+
+  You CAN and SHOULD express your judgment about what the score "would be" if drive resolved — but ONLY in the icp_score_d2d_breakdown TEXT field. Never in the icp_score_d2d NUMBER.
+
+  WRONG (synthesis overriding the number — this is what happened on the prior calibration run):
+    Strict formula = 53. Model emits icp_score_d2d = 83 with breakdown "True D2D score likely 83+ if drive confirmed."
+    This is forbidden. The reviewer sees 83 and trusts it; they have no idea the formula said 53.
+
+  CORRECT (synthesis emitting the formula result, explaining context in text):
+    Strict formula = 53. Model emits icp_score_d2d = 53 with breakdown "Drive component 0 (geocode_failed for company HQ address). Strict score 53. NOTE: company HQ is in Ocoee, FL, ~24 min from TerraGenie HQ; if drive had resolved, +35 tier would have applied bringing strict score to 88. Reviewer may treat 53 as a floor."
+    Now the reviewer sees the conservative 53, the breakdown explains exactly why and what the upside is, and the geo-blind state is transparent.
+
+  WRONG (output-tuning to land in calibration band):
+    Strict formula = 8. Model emits icp_score_d2d = 36 with breakdown "Calibration ground truth shows enterprise GCs in 35-55 band, adjusting to 36."
+    Forbidden. If your factors produced 8 for a company you believe should be 35-55, your factors are wrong, not your output.
+
+  CORRECT (re-examining factor inputs when the result feels off):
+    Strict formula = 8 for Hillpointe seems too low. Volume signal at 10/30 is too low — Hillpointe actively builds 5000+ units annually, that's high volume even though D2D-unfriendly. Re-rate volume to 18/30. New base = 36. 36 × 0.30 = 10.8 → 11. + 35 drive = 46. Emit 46.
+
+  Pre-flight check before emitting:
+    1. Did I compute base_fit_volume + base_fit_dm + base_fit_complexity? (these three sum to layer-1 base)
+    2. Did I apply ONE business-type multiplier? (not stacked, just one)
+    3. Did I add drive_data.d2d_points_from_distance VERBATIM? (not derived)
+    4. Did I clamp to 0-100?
+    5. Does my emitted number match the math? If not, FIX THE NUMBER, not the math.
 
 CALIBRATION GROUND-TRUTH (use these to CHECK your factor inputs, not to override your output):
   Ideal D2D, expected D2D 85-100, Revenue 70-90:
@@ -1228,35 +1253,36 @@ function resolveHqAddress(findings, businessRecord) {
 
 // Compute drive time + distance + tier points from TerraGenie HQ. Returns
 // a small summary object that the synthesis stage receives via user message.
-// Returns null on any failure so synthesis falls back to geo-blind D2D
-// scoring (the synthesis prompt handles that case explicitly).
+// Falls back to a structured "skipped" payload on any failure so synthesis
+// can degrade gracefully (geo-blind D2D score). The skipped_reason field
+// distinguishes the failure mode so the synthesis prompt can give an
+// accurate breakdown text and the operator can debug.
 async function computeDriveData(findings, businessRecord) {
   const resolved = resolveHqAddress(findings, businessRecord);
+  const baseSkipped = {
+    drive_time_minutes: null,
+    distance_miles: null,
+    d2d_points_from_distance: 0,
+    hq_address_resolved: resolved.address,
+    hq_address_source: resolved.source,
+    hq_address_confidence: resolved.confidence
+  };
   if (!resolved.address) {
-    console.log('[drive-time] no usable HQ address, skipping ORS call');
-    return {
-      drive_time_minutes: null,
-      distance_miles: null,
-      d2d_points_from_distance: 0,
-      hq_address_resolved: null,
-      hq_address_source: resolved.source,
-      hq_address_confidence: resolved.confidence,
-      skipped_reason: 'no_address'
-    };
+    console.log('[drive-time] no usable HQ address from any source, skipping ORS call');
+    return { ...baseSkipped, skipped_reason: 'no_address' };
   }
   try {
-    const route = await getDriveFromTerraGenieHQ(resolved.address);
+    // Two-step lookup so we can distinguish geocode failure from ORS failure
+    const { geocodeAddress, getDriveRoute, getOriginCoords } = require('./_maps');
+    const destCoords = await geocodeAddress(resolved.address);
+    if (!destCoords) {
+      console.log(`[drive-time] geocode failed for "${resolved.address}"`);
+      return { ...baseSkipped, skipped_reason: 'geocode_failed' };
+    }
+    const route = await getDriveRoute(getOriginCoords(), destCoords);
     if (!route) {
-      console.log(`[drive-time] route lookup returned null for "${resolved.address}"`);
-      return {
-        drive_time_minutes: null,
-        distance_miles: null,
-        d2d_points_from_distance: 0,
-        hq_address_resolved: resolved.address,
-        hq_address_source: resolved.source,
-        hq_address_confidence: resolved.confidence,
-        skipped_reason: 'route_lookup_failed'
-      };
+      console.log(`[drive-time] ORS route failed for "${resolved.address}" (coords resolved ok)`);
+      return { ...baseSkipped, skipped_reason: 'ors_route_failed' };
     }
     const points = driveTimeToD2DPoints(route.duration_minutes);
     console.log(`[drive-time] "${resolved.address}" -> ${route.duration_minutes}min, ${route.distance_miles}mi, tier=${points}`);
@@ -1271,15 +1297,7 @@ async function computeDriveData(findings, businessRecord) {
     };
   } catch (err) {
     console.warn(`[drive-time] threw: ${err.message}`);
-    return {
-      drive_time_minutes: null,
-      distance_miles: null,
-      d2d_points_from_distance: 0,
-      hq_address_resolved: resolved.address,
-      hq_address_source: resolved.source,
-      hq_address_confidence: resolved.confidence,
-      skipped_reason: `error: ${err.message}`
-    };
+    return { ...baseSkipped, skipped_reason: `error: ${err.message}` };
   }
 }
 

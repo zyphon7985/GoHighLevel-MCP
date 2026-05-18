@@ -52,41 +52,86 @@ function isValidLonLat(coords) {
 
 // ─── Geocoding (OSM Nominatim) ─────────────────────────────────────────────
 
+// Strip suite/unit/apt/ste/#/floor/building modifiers from an address.
+// Nominatim's free tier does not index individual unit numbers, and the
+// presence of a unit modifier causes the whole geocode to fail rather than
+// fall back to the street-level match. Stripping these recovers the match
+// without losing meaningful location precision (a 6-story building's suite
+// 375 vs suite 104 is irrelevant for drive-time scoring).
+//
+// Examples:
+//   "2222 Ocoee Apopka Rd Suite 104, Ocoee, FL 34761"
+//     -> "2222 Ocoee Apopka Rd, Ocoee, FL 34761"
+//   "5401 S Kirkman Rd, Suite 375, Orlando, FL 32819"
+//     -> "5401 S Kirkman Rd, Orlando, FL 32819"
+//   "100 Main St Apt 5B, Tampa FL"
+//     -> "100 Main St, Tampa FL"
+function cleanAddressForGeocoding(addressString) {
+  if (!addressString || typeof addressString !== 'string') return addressString;
+  // Strip "Suite/Ste/Unit/Apt/Apartment/Floor/Bldg/Building XXX" patterns,
+  // with or without leading comma. Do NOT include "fl" as a token (it
+  // collides with the state "FL" + zip pattern, e.g. "FL 34761" was being
+  // stripped). "Floor" spelled out is still caught.
+  let out = addressString
+    .replace(/,?\s*(?:suite|ste|unit|apt|apartment|floor|bldg|building)\s+[\w\-#]+/gi, '')
+    .replace(/,?\s*#\s*[\w\-]+/g, '')
+    // Collapse double commas + extra whitespace caused by the strip
+    .replace(/,\s*,/g, ',')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/\s*,\s*/g, ', ')
+    .replace(/,\s*$/, '')
+    .trim();
+  return out;
+}
+
 // Geocode a free-form address string to [longitude, latitude].
-// Returns null on failure or no match. Logs warning on hard failures.
+// Tries the address as-given first, then a cleaned version with suite/unit
+// modifiers stripped (Nominatim free tier limitation workaround).
+// Returns null on failure or no match.
 async function geocodeAddress(addressString) {
   if (!addressString || typeof addressString !== 'string' || addressString.trim().length === 0) {
     return null;
   }
-  const q = addressString.trim();
-  const url = `${NOMINATIM_SEARCH_URL}?q=${encodeURIComponent(q)}&format=json&limit=1&countrycodes=us`;
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': NOMINATIM_USER_AGENT,
-        'Accept': 'application/json'
+  const original = addressString.trim();
+  const cleaned = cleanAddressForGeocoding(original);
+  const attempts = cleaned && cleaned !== original ? [original, cleaned] : [original];
+
+  for (const q of attempts) {
+    const url = `${NOMINATIM_SEARCH_URL}?q=${encodeURIComponent(q)}&format=json&limit=1&countrycodes=us`;
+    try {
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': NOMINATIM_USER_AGENT,
+          'Accept': 'application/json'
+        }
+      });
+      if (!res.ok) {
+        console.warn(`[maps] nominatim status=${res.status} for "${q.substring(0, 80)}"`);
+        continue;
       }
-    });
-    if (!res.ok) {
-      console.warn(`[maps] nominatim status=${res.status} for "${q.substring(0, 80)}"`);
-      return null;
+      const arr = await res.json();
+      if (!Array.isArray(arr) || arr.length === 0) {
+        console.warn(`[maps] nominatim no match for "${q.substring(0, 80)}"`);
+        // brief sleep before retry attempt to be polite to Nominatim
+        if (attempts.length > 1) await new Promise(r => setTimeout(r, 200));
+        continue;
+      }
+      const lat = parseFloat(arr[0].lat);
+      const lon = parseFloat(arr[0].lon);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+        console.warn(`[maps] nominatim returned non-numeric coords for "${q.substring(0, 80)}"`);
+        continue;
+      }
+      if (q !== original) {
+        console.log(`[maps] geocoded via cleaned fallback: "${original.substring(0, 60)}" -> "${q.substring(0, 60)}"`);
+      }
+      return [lon, lat];
+    } catch (err) {
+      console.warn(`[maps] nominatim threw on "${q.substring(0, 80)}": ${err.message}`);
+      continue;
     }
-    const arr = await res.json();
-    if (!Array.isArray(arr) || arr.length === 0) {
-      console.warn(`[maps] nominatim no match for "${q.substring(0, 80)}"`);
-      return null;
-    }
-    const lat = parseFloat(arr[0].lat);
-    const lon = parseFloat(arr[0].lon);
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-      console.warn(`[maps] nominatim returned non-numeric coords for "${q.substring(0, 80)}"`);
-      return null;
-    }
-    return [lon, lat];
-  } catch (err) {
-    console.warn(`[maps] nominatim threw: ${err.message}`);
-    return null;
   }
+  return null;
 }
 
 // ─── ORS Directions ────────────────────────────────────────────────────────
@@ -202,6 +247,7 @@ module.exports = {
   getDriveFromTerraGenieHQ,
   driveTimeToD2DPoints,
   getOriginCoords,
+  cleanAddressForGeocoding,
   // Exposed for testing / direct use
   ORIGIN_ADDRESS,
   HQ_COORDS_HARDCODED,
