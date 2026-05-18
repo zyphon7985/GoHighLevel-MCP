@@ -562,10 +562,10 @@ const EMIT_ENRICHMENT_TOOL = {
       },
       brief: {
         type: 'object',
-        description: 'Pre-call brief sections. Stage 3 selects the template by classification and assembles. Populate the sections that apply to this classification (see Phase 6 brief templates in the skill). opening_angles is MANDATORY for every classification.',
+        description: 'Pre-call brief sections. Stage 3 selects the template by classification and assembles. Populate the sections that apply to this classification (see BRIEF SECTIONS block in the system prompt). brief.who and brief.opening_angles MUST be non-empty regardless of classification, customer_why_fits / lead_source / contact_info MUST be non-empty when the classification calls for them. Empty strings or empty arrays fail the brief.',
         properties: {
           header_flag: { type: 'string', description: 'Customer only, optional. Use plain text like "TOP PRIORITY LEAD" when ICP score is 90+, or a warning marker when there is a data discrepancy. Stage 3 prepends visual decoration.' },
-          who: { type: 'string', description: 'WHO HE/SHE IS (customer, low_fit) or WHO THEY ARE (partner) — 2-4 sentence narrative.' },
+          who: { type: 'string', minLength: 40, description: 'WHO HE/SHE IS (customer, low_fit) or WHO THEY ARE (partner) — 2-4 sentence narrative. MUST be non-empty. Minimum ~40 characters.' },
           company: { type: 'string', description: 'THE COMPANY — 2-4 sentence narrative. Used for customer and low_fit; optional for partner.' },
           lead_source: { type: 'string', description: 'LEAD SOURCE line. Format example: "Source: Web Form - Demo Request - submitted at IBS expo, indicates active interest". Used for customer and low_fit.' },
           customer_why_fits: { type: 'string', description: 'WHY TerraGenie FITS — customer only. 2-3 sentences specific to this company.' },
@@ -580,11 +580,11 @@ const EMIT_ENRICHMENT_TOOL = {
           failure_next_steps: { type: 'string', description: 'RECOMMENDED NEXT STEPS — failure only.' },
           opening_angles: {
             type: 'array',
-            items: { type: 'string' },
+            items: { type: 'string', minLength: 30 },
             minItems: 2,
-            description: 'MANDATORY for every classification. 2-3 ready-to-use opening lines. When data is thin, anchor on lead source / form responses / geography / company name and explicitly note the limitation.'
+            description: 'MANDATORY for every classification, 2-3 ready-to-use opening lines as full sentences. Each entry must be a complete opener the rep can read verbatim (minimum ~30 chars). Empty array or empty strings fail the brief. When data is thin, anchor on lead source / form responses / geography / company name and explicitly note the limitation in the opener text itself.'
           },
-          contact_info: { type: 'string', description: 'Pre-formatted multi-line block with available email, phone, LinkedIn, etc.' }
+          contact_info: { type: 'string', description: 'Pre-formatted multi-line block with available email, phone, LinkedIn, etc. Required for customer / partner / low_fit classifications when any contact channel is on file.' }
         },
         required: ['who', 'opening_angles']
       }
@@ -681,7 +681,7 @@ Steps to perform, in order:
 
    year_founded: omit entirely if no confirmed year. Never emit 0 (displays as "Year Founded: 0" in GHL).
 
-8. Compute business_fields, name_corrections, and brief sections per classification, then generate enrichment_foundation per its schema description.
+8. Compute business_fields and name_corrections. Then GENERATE all brief sections for the chosen classification, populating each field with real prose content (the BRIEF SECTIONS block below lists which fields per classification). brief.who and brief.opening_angles are MANDATORY non-empty — emitting empty strings or empty arrays for these fails the brief. customer_why_fits, lead_source, and contact_info are also required when applicable to the classification. Finally generate enrichment_foundation per its schema description.
 
 DUAL ICP SCORING (added 2026-05-18 — supersedes any single-score guidance in the skill):
 
