@@ -452,7 +452,7 @@ const STAGE1_TOOLS = [
           }
         }
       },
-      required: ['sufficient', 'classification_intent', 'contact_summary', 'sources_used', 'research_summary']
+      required: ['sufficient', 'classification_intent', 'contact_summary', 'sources_used', 'research_summary', 'hq_address']
     }
   }
 ];
@@ -615,7 +615,25 @@ Tools NOT available:
 
 When you have enough data to confidently classify the lead AND score at least 3 of the 6 ICP factors, call emit_research_findings with the structured payload. Be thorough but bounded — once you have enough, stop researching and emit. Adaptive multi-source fallback is preserved: if Apollo org is empty or Firecrawl yields thin data, run the Phase 4b fallback chain (Sunbiz, Google Maps, LinkedIn) before emitting. Conditional sub-page scrapes (/about, /services, /our-work) are encouraged when the homepage is thin.
 
-REQUIRED: populate hq_address in emit_research_findings. Driving distance from TerraGenie HQ (5322 Ridgeway Dr, Orlando, FL 32819) is now the dominant factor in the D2D ICP score. Use the best available source for the company's HQ or primary office address (Apollo org street+city+state first, then Firecrawl contact page, then Sunbiz, then a city/state inference from service_area). If you only have city+state, that is still useful — set full_address to "City, ST" and source="service_area_inference" with confidence="low". Set confidence="none" only when there is genuinely no geographic signal at all.
+STRICTLY REQUIRED: populate hq_address.full_address in emit_research_findings with a non-empty geocodable string. This is now a required schema field. Driving distance from TerraGenie HQ (5322 Ridgeway Dr, Orlando, FL 32819) is the dominant factor in the D2D ICP score; failing to surface an address makes the whole score collapse.
+
+Resolution priority (use the FIRST one that yields something):
+  1. Apollo organization street + city + state + postal_code (best, full street address)
+  2. Firecrawl contact / about / footer page address (very common)
+  3. Sunbiz principal-place-of-business address (FL LLCs)
+  4. GHL business record address
+  5. Apollo org city + state only (good fallback if no street)
+  6. service_area inference — if the company's service area mentions specific FL cities, use the most likely HQ city as "<City>, FL". For example if service_area is "Central Florida (Ocoee, Orlando, Winter Springs)", set full_address = "Ocoee, FL" (the first city listed is usually the primary). If service_area is "South Florida (Miami, Fort Lauderdale)", use "Miami, FL".
+
+ACCEPTABLE values for full_address (any of these work — partial is far better than empty):
+  - Full street: "2222 Ocoee Apopka Rd Suite 104, Ocoee, FL 34761"
+  - City + state: "Winter Park, FL"
+  - Metro region: "Orlando metro, FL"
+  - State only: "Florida" (last resort if NO city signal exists anywhere)
+
+DO NOT EMIT empty string or "Unknown" or omit the field. If literally no geographic signal exists across ALL the sources you searched (very rare), set full_address = "Florida" with confidence = "low" and source = "default_state_fallback".
+
+DO NOT set confidence = "none" unless you genuinely searched all sources and found zero geo signal. "Service area mentions FL" is a geo signal.
 
 POC RESEARCH (NEW): in addition to enriching the lead-form contact, hunt for 2-3 OTHER decision-makers at the same company so the sales rep can name-drop when calling the company main line. Populate the pocs[] array in emit_research_findings. Target senior decision-makers only: Owner / Principal / President / CEO / Co-Founder / VP / GM / COO / Head of Operations / Head of Field / Director of Survey / Controller. Skip junior staff and individual contributors.
 
@@ -697,28 +715,64 @@ B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
      0.10x  General landscaping (mow-and-blow / lawn maintenance)
      0.00x  Out of vertical (property management, insurance, retail, etc.)
 
-   Layer 3 — drive-time tier points (READ FROM drive_data.d2d_points_from_distance — DO NOT recompute):
-     +35 if drive_time_minutes < 45 (Orlando metro core)
-     +25 if 45-90 (Tampa, Lakeland, Daytona, Ocala band)
-     +10 if 90-150 (Gainesville, Vero, Sarasota band)
-     -5  if 150-240 (Jacksonville, far panhandle band)
-     -15 if 240-360
-     -20 if >= 360 or null (geography unavailable)
+   Layer 3 — drive-time tier points (THIS IS A PRE-COMPUTED INTEGER IN drive_data.d2d_points_from_distance):
+     The pipeline already mapped drive_time_minutes to the right tier value BEFORE you saw it. Your only job is to READ drive_data.d2d_points_from_distance and ADD it to the layer-1 result. Do NOT re-derive this from drive_time_minutes. Do NOT decide the drive lookup "failed" based on your own reading.
 
-   Final: icp_score_d2d = clamp(layer1_after_multiplier + drive_points, 0, 100)
+     RULES FOR READING drive_data:
+       1. If drive_data.d2d_points_from_distance is a number (including 0): use that number verbatim as your drive_points. Do not adjust it.
+       2. If drive_data.drive_time_minutes is a positive number, ALWAYS use drive_data.d2d_points_from_distance as your drive_points. The pipeline computed it correctly; trust it.
+       3. The ONLY case where you can describe the lookup as "failed" or "geo-blind" is when drive_data.skipped_reason is non-null. Otherwise drive_data is valid and you must use it.
 
-   If drive_data.drive_time_minutes is null: set the drive component to 0 (not -20) and add "drive time unavailable, geo-blind D2D score" to icp_score_d2d_breakdown.
+   Reference table (for context only, do NOT recompute):
+     drive_time_minutes < 45 → +35 (Orlando metro core)
+     45-90 → +25 (Tampa, Lakeland, Daytona, Ocala band)
+     90-150 → +10 (Gainesville, Vero, Sarasota band)
+     150-240 → -5 (Jacksonville, far panhandle band)
+     240-360 → -15
+     >= 360 → -20
 
-CALIBRATION GROUND-TRUTH (from Gal Goffer, TerraGenie sales lead, 2026-05-18, ranked from actual D2D experience):
-  Ideal D2D — mid-size builders in Orlando area, expected D2D 85-100, expected Revenue 70-90:
-    Kings Homes, Poli Construction, Phil Kean, Ross Built, Truemark Construction, Supreme Construction, RS Construction, McNally Construction, INB Homes
-  Too big for D2D — enterprise GCs, multi-state, deep org charts, expected D2D 35-55, expected Revenue 90-100 (insane wins if landed, but D2D motion is hard):
+   Final: icp_score_d2d = clamp(layer1_after_multiplier + drive_data.d2d_points_from_distance, 0, 100)
+
+   Worked example A (Hillpointe-shape, drive_data valid):
+     drive_data = { drive_time_minutes: 25, d2d_points_from_distance: 35, skipped_reason: null }
+     base_fit = 28 (volume 10 + DM 5 + complexity 13)
+     multiplier = 0.30 (Enterprise GC)
+     layer1 = 28 × 0.30 = 8.4 → 8
+     drive_points = 35 (from drive_data, NOT re-derived)
+     icp_score_d2d = clamp(8 + 35, 0, 100) = 43
+     icp_score_d2d_breakdown = "Drive 25min/+35 (Orlando metro); Type 0.30x (Enterprise GC); Volume 10/30; DM 5/20; Complexity 13/15; Base 28×0.30=8; +35 drive = 43"
+
+   Worked example B (Truemark-shape, drive_data valid):
+     drive_data = { drive_time_minutes: 22, d2d_points_from_distance: 35, skipped_reason: null }
+     base_fit = 48 (volume 18 + DM 18 + complexity 12)
+     multiplier = 1.00 (mid-size commercial GC, owner-led, in size sweet spot — commercial GCs at 1-10 employees ARE the sweet spot when owner-led; do NOT apply small-residential 0.40x to commercial)
+     layer1 = 48 × 1.00 = 48
+     drive_points = 35
+     icp_score_d2d = clamp(48 + 35, 0, 100) = 83
+
+   Worked example C (drive_data unavailable):
+     drive_data = { drive_time_minutes: null, d2d_points_from_distance: 0, skipped_reason: "no_address" }
+     Treat drive_points = 0 (NOT -20). Append "drive time unavailable, geo-blind D2D score" to icp_score_d2d_breakdown.
+     Omit est_drive_time_min from emit_enrichment entirely (do NOT emit 0).
+
+ABSOLUTE FORMULA DISCIPLINE (CRITICAL — read this twice):
+  Your emitted icp_score_d2d MUST equal the strict formula result with the factor values you chose. Do not adjust the final number to "land in a calibration band". If your strict-formula result is 8 and you think the answer should be 36, that means one of your FACTOR VALUES is wrong — go back and reconsider volume signal, DM accessibility, operational complexity, or the multiplier. Adjust those factor values within their legitimate ranges (don't push values past their natural bounds either), then recompute. Emit the recomputed strict result.
+
+  WRONG (model fudging):
+    "Strict formula gives 8 but calibration says 36, so I'll emit 36."
+  RIGHT (model re-examining inputs):
+    "Strict formula gives 8 which is too low. Volume signal at 10/30 seems low for an enterprise GC actively building 5000 units/year — that's high volume even if D2D-unfriendly. Bumping volume to 18/30. New base = 28+8 = 36. 36×0.30 = 11. + 35 drive = 46. Emit 46."
+
+CALIBRATION GROUND-TRUTH (use these to CHECK your factor inputs, not to override your output):
+  Ideal D2D, expected D2D 85-100, Revenue 70-90:
+    Kings Homes, Poli Construction, Phil Kean, Ross Built, Truemark Construction, Supreme Construction, RS General Construction, McNally Construction, INB Homes
+  Too big for D2D, expected D2D 35-55, Revenue 90-100:
     Brasfield & Gorrie, Hillpointe, SDC (Southern Development and Construction), DPR
-  Too small — sub-10-homes/year residential, expected D2D 30-45, expected Revenue 25-40:
+  Too small, expected D2D 30-45, Revenue 25-40:
     Posada Homes
-  Adjacent verticals — only score high if geography + project count sweet spot AND complex enough to need layout (high-end luxury landscape design = yes, local mow-and-blow = no).
+  Adjacent verticals: only score high if geography + project count sweet spot AND complex enough to need layout.
 
-If your computed scores for similar-shape companies fall outside these expected bands, recheck your business-type multiplier and project-volume signal before emitting.
+  How to use calibration: after you compute icp_score_d2d strictly, glance at the band for the company shape. If your result is FAR outside the expected band (e.g. enterprise GC scored 90, sweet-spot builder scored 30), that's a signal your FACTOR INPUTS need re-examination. Re-do the math with adjusted factor values. Never patch the output by adding arbitrary points.
 
 POC DISTILLATION:
 findings.pocs contains raw POC candidates from Stage 1 research. Distill into the final poc_research array (max 3):
@@ -1442,8 +1496,10 @@ function formatBrief(enrichment, { contactName, companyName }) {
 
   const headerLine1 = (header) => `${header} - ${contactName || 'Unknown Contact'} / ${companyName || 'Unknown Company'}`;
 
-  // Compact dual-score metadata line. Drive time is only included when known.
-  const driveSuffix = (driveTime != null && Number.isFinite(driveTime))
+  // Compact dual-score metadata line. Drive time is only included when known
+  // (positive integer). 0 means the geocoder couldn't resolve the HQ; show
+  // "unknown" rather than misleading "0min from HQ".
+  const driveSuffix = (driveTime != null && Number.isFinite(driveTime) && driveTime > 0)
     ? ` | Drive: ${Math.round(driveTime)}min from HQ`
     : ' | Drive: unknown';
   const scoresLine = `D2D Score: ${scoreD2D}/100 | Revenue Score: ${scoreRevenue}/100 (${confidence}) | Segment: ${segment}${driveSuffix}`;
@@ -1595,10 +1651,14 @@ async function writeContactFields({ contactId, enrichment, existingContactSource
     enrichment_date: today
   };
 
-  // est_drive_time_min: only write when synthesis emitted a value. Omit
-  // entirely if unavailable so GHL doesn't show "0 min" for contacts with
-  // no resolvable HQ address.
-  if (enrichment.est_drive_time_min != null && Number.isFinite(enrichment.est_drive_time_min)) {
+  // est_drive_time_min: only write when synthesis emitted a positive value.
+  // 0 leaks through as a "missing" sentinel (the model occasionally emits 0
+  // when drive_data.drive_time_minutes was null, despite schema saying to
+  // omit). Treating 0 as missing prevents GHL from displaying "0 min" for
+  // contacts where the geocoder couldn't resolve their HQ address.
+  if (enrichment.est_drive_time_min != null
+    && Number.isFinite(enrichment.est_drive_time_min)
+    && enrichment.est_drive_time_min > 0) {
     fieldValues.est_drive_time_min = enrichment.est_drive_time_min;
   }
 
