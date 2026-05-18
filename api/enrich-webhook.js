@@ -464,7 +464,22 @@ const EMIT_ENRICHMENT_TOOL = {
     type: 'object',
     properties: {
       classification: { type: 'string', enum: ['customer', 'partner', 'low_fit', 'failure'] },
-      icp_score: { type: 'integer', minimum: 0, maximum: 100 },
+      icp_score: {
+        type: 'integer',
+        minimum: 0,
+        maximum: 100,
+        description: 'REVENUE/OPPORTUNITY FIT score (0-100). "How big a win if we land them, ignoring sales-cycle difficulty and geography." Heavy weight on revenue tier, deal-size potential, decision-maker access. NO geography weighting (geography lives in icp_score_d2d). Enterprise GCs that are sales-cycle nightmares can still score 90+ here because the dollar value of landing them is huge.'
+      },
+      icp_score_d2d: {
+        type: 'integer',
+        minimum: 0,
+        maximum: 100,
+        description: 'DOOR-TO-DOOR FIT score (0-100). "Should a TerraGenie rep drive there and knock?" Heavy weight on driving distance from HQ + business-type taxonomy + project-volume sweet spot. ENTERPRISE GCs score LOW here even if revenue potential is huge — too many decision-makers, too long a cycle for D2D motion. Computation: start from base fit (business type + project volume + decision-maker accessibility, scored 0-65), apply business-type multiplier (1.0 for sweet-spot builders down to 0.0 for out-of-vertical), then ADD the drive-time tier points from drive_data.d2d_points_from_distance (range -20 to +35). Clamp final to 0-100. If drive_data.drive_time_minutes is null, set the geography component to 0 and note "drive time unavailable" in icp_score_d2d_breakdown.'
+      },
+      icp_score_d2d_breakdown: {
+        type: 'string',
+        description: 'Factor-by-factor breakdown of the D2D score. Example: "Drive 25min/+35 (Orlando metro); Business type 1.0x (mid-size residential builder); Volume signal 20/25 (30-50 homes/yr est); Decision-maker accessibility 10/15 (owner findable); Size penalty 0 (right band)". Stage 3 renders this in the brief next to the score.'
+      },
       confidence_level: { type: 'string', enum: ['High', 'Medium', 'Low', 'Very Low'] },
       icp_segment: {
         type: 'string',
@@ -473,7 +488,29 @@ const EMIT_ENRICHMENT_TOOL = {
       engagement_signal: { type: 'string', description: 'One-liner per Phase 6 Step 5.' },
       icp_scoring_breakdown: {
         type: 'string',
-        description: 'Factor-by-factor breakdown text. Example: "Industry 35/35 (Construction); Geography 22/25 (FL projects); Decision Maker 15/15 (CEO); Company Size 12/15 (Small 11-50); Revenue 0/5 (Unknown); Digital Presence 5/5 (Full website)". Used by Stage 3 in the brief.'
+        description: 'Factor-by-factor breakdown of the REVENUE score. Example: "Industry 35/35 (Construction); Decision Maker 15/15 (CEO); Company Size 12/15 (Mid-market 50-200); Revenue Potential 25/30 ($10M-$50M est); Digital Presence 5/5 (Full website)". Used by Stage 3 in the brief alongside icp_score_d2d_breakdown.'
+      },
+      est_drive_time_min: {
+        type: 'integer',
+        description: 'The driving time in minutes from TerraGenie HQ to the company HQ. ALWAYS copy this value verbatim from drive_data.drive_time_minutes (round to nearest integer). If drive_data.drive_time_minutes is null, omit this field entirely. Do not invent or estimate — only echo what the deterministic ORS lookup produced.'
+      },
+      poc_research: {
+        type: 'array',
+        description: 'Distilled decision-maker POC list (2-3 max) drawn from findings.pocs. Sales reps name-drop these when calling the main line and the lead-form contact does not answer. Deduplicate the raw pocs[], drop low-confidence entries unless the company is very small, preserve verbatim contact channels, order by seniority. Skip the lead-form contact themselves. Empty array is acceptable if no high-confidence POCs were found.',
+        items: {
+          type: 'object',
+          properties: {
+            name: { type: 'string' },
+            title: { type: 'string' },
+            phone: { type: 'string', description: 'Empty string if not found.' },
+            email: { type: 'string', description: 'Empty string if not found.' },
+            linkedin_url: { type: 'string', description: 'Empty string if not found.' },
+            source: { type: 'string', description: 'Source(s) the POC was confirmed from, comma-separated if multiple.' },
+            confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
+            name_drop_hook: { type: 'string', description: 'Optional 1-line context the rep can mention when calling the main line: "Recently quoted in the Orlando Business Journal on labor costs", "Co-founded with [other person] in 2003", "Listed on the leadership page as VP of Field Ops". Empty if no specific hook.' }
+          },
+          required: ['name', 'title', 'confidence']
+        }
       },
       enrichment_foundation: {
         type: 'string',
@@ -552,7 +589,7 @@ const EMIT_ENRICHMENT_TOOL = {
         required: ['who', 'opening_angles']
       }
     },
-    required: ['classification', 'icp_score', 'confidence_level', 'icp_segment', 'contact_fields', 'brief']
+    required: ['classification', 'icp_score', 'icp_score_d2d', 'confidence_level', 'icp_segment', 'contact_fields', 'brief']
   }
 };
 
@@ -612,14 +649,86 @@ function buildSynthesisSystemPrompt() {
 
 Steps to perform, in order:
 1. Classify the lead per Phase 6 Step 1: customer, partner, low_fit, or failure. Use Stage 1's classification_intent as a starting point but refine if the data warrants it.
-2. Compute the ICP score (0-100) and confidence level using the rubric in Phase 6 Steps 2 and 3. Apply the gatekeeper modifier and the geography "project footprint, not HQ" rule.
+2. Compute BOTH ICP scores (see "DUAL ICP SCORING" section below for the full rules):
+   - icp_score: 0-100, REVENUE/OPPORTUNITY fit only, no geography weighting
+   - icp_score_d2d: 0-100, DOOR-TO-DOOR fit, dominated by driving distance + business-type taxonomy
+   Apply confidence_level to the lower of the two.
 3. Determine the ICP segment per Phase 6 Step 4 (e.g., "Primary - Civil/Construction", "Partner - Technology Vendor", "Low Fit - Property Management").
-4. Populate icp_scoring_breakdown with a one-line per-factor breakdown for the brief.
-5. Compute the 16 contact custom field values per the field mappings in Phase 6. Leave a field as empty string ("") if you cannot determine its value, Stage 3 will skip empties so existing GHL data is preserved. enrichment_date is set automatically by Stage 3; do not include it.
+4. Populate icp_scoring_breakdown (revenue) AND icp_score_d2d_breakdown (D2D) with one-line per-factor explanations for the brief.
+5. Echo est_drive_time_min from drive_data.drive_time_minutes (rounded to integer). Omit if drive_data.drive_time_minutes is null.
+6. Distill poc_research from findings.pocs (see "POC DISTILLATION" section).
+7. Compute the contact custom field values per the field mappings in Phase 6. Leave a field as empty string ("") if you cannot determine its value, Stage 3 will skip empties so existing GHL data is preserved. enrichment_date is set automatically by Stage 3; do not include it.
 
-   IMPORTANT field placement: icp_score and icp_segment go ONLY at the top level of emit_enrichment, NOT inside contact_fields. Stage 3 reads them from the top level when writing the contact custom fields. Do not also duplicate them inside contact_fields.
+   IMPORTANT field placement: icp_score, icp_score_d2d, icp_segment, est_drive_time_min go ONLY at the top level of emit_enrichment, NOT inside contact_fields. Stage 3 reads them from the top level. Do not also duplicate them inside contact_fields.
 
    IMPORTANT for year_founded: omit the field entirely from contact_fields if you do not have a confirmed year. Do NOT set it to 0, that writes a literal "0" to GHL which displays as "Year Founded: 0".
+
+DUAL ICP SCORING (added 2026-05-18 — supersedes any single-score guidance in the skill):
+
+A) icp_score (REVENUE/OPPORTUNITY, 0-100, no geography)
+   The pure "how big is the win if we land them" score, independent of sales-cycle difficulty.
+   Inputs and weights (sum to 100):
+     Industry fit / TerraGenie use case (0-30): construction-adjacent verticals with layout/grade-check needs score full; non-fit verticals score 0
+     Revenue potential (0-25): higher revenue / larger projects = higher score
+     Decision-maker access (0-20): identified senior decision-maker with verified channel = full; gatekeeper-only or unknown = partial
+     Company size signal (0-15): mid-market and up score full; nano-shops score lower (less capacity to pay)
+     Digital presence / discoverability (0-10): mature website, LinkedIn, press = full
+   Result: a giant enterprise GC with $500M revenue scores 95+ here even if sales cycle is brutal. That is correct.
+
+B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
+   The "should a rep drive there and knock today" score. For the next 3-6 months TerraGenie wants reps spending door-knock time on the SWEET SPOT: mid-size local builders/contractors in the Orlando driving radius.
+
+   Compute in three layers:
+
+   Layer 1 — base fit (0-65 points):
+     Project volume signal (0-30): mid-volume sweet spot (10-100 homes/yr residential OR 5+ commercial projects/yr) scores full. Tiny (<10 homes/yr) scores low. Giants score low here too. Inferred from revenue + size when not stated explicitly.
+     Decision-maker accessibility (0-20): owner/principal findable = full. Multi-layer org with gatekeeper = low. Lead-form contact is a real decision-maker = bonus.
+     Business operational complexity (0-15): companies whose work requires field layout regularly (commercial GC, heavy civil, utility, high-end residential, large-scale landscape) score full. Mow-and-blow landscapers, pure interior-only finish work, pure paperwork brokers score low.
+
+   Layer 2 — business-type multiplier (apply to base_fit before adding drive points; clamp to 0-65):
+     1.00x  Mid-size residential builder (10-100 homes/yr)
+     1.00x  Mid-size commercial contractor (5+ projects/yr)
+     1.00x  Heavy civil / site work contractor in the size sweet spot
+     0.95x  Utility contractor (water/sewer/gas) in size sweet spot
+     0.85x  High-end landscape design / hardscape (NOT general mow-and-blow)
+     0.75x  Pool / outdoor structure builder (size sweet spot)
+     0.40x  Small residential GC (<10 homes/yr)
+     0.30x  Enterprise GC (200+ employees, multi-state, deep org chart) — too big for D2D motion
+     0.10x  General landscaping (mow-and-blow / lawn maintenance)
+     0.00x  Out of vertical (property management, insurance, retail, etc.)
+
+   Layer 3 — drive-time tier points (READ FROM drive_data.d2d_points_from_distance — DO NOT recompute):
+     +35 if drive_time_minutes < 45 (Orlando metro core)
+     +25 if 45-90 (Tampa, Lakeland, Daytona, Ocala band)
+     +10 if 90-150 (Gainesville, Vero, Sarasota band)
+     -5  if 150-240 (Jacksonville, far panhandle band)
+     -15 if 240-360
+     -20 if >= 360 or null (geography unavailable)
+
+   Final: icp_score_d2d = clamp(layer1_after_multiplier + drive_points, 0, 100)
+
+   If drive_data.drive_time_minutes is null: set the drive component to 0 (not -20) and add "drive time unavailable, geo-blind D2D score" to icp_score_d2d_breakdown.
+
+CALIBRATION GROUND-TRUTH (from Gal Goffer, TerraGenie sales lead, 2026-05-18, ranked from actual D2D experience):
+  Ideal D2D — mid-size builders in Orlando area, expected D2D 85-100, expected Revenue 70-90:
+    Kings Homes, Poli Construction, Phil Kean, Ross Built, Truemark Construction, Supreme Construction, RS Construction, McNally Construction, INB Homes
+  Too big for D2D — enterprise GCs, multi-state, deep org charts, expected D2D 35-55, expected Revenue 90-100 (insane wins if landed, but D2D motion is hard):
+    Brasfield & Gorrie, Hillpointe, SDC (Southern Development and Construction), DPR
+  Too small — sub-10-homes/year residential, expected D2D 30-45, expected Revenue 25-40:
+    Posada Homes
+  Adjacent verticals — only score high if geography + project count sweet spot AND complex enough to need layout (high-end luxury landscape design = yes, local mow-and-blow = no).
+
+If your computed scores for similar-shape companies fall outside these expected bands, recheck your business-type multiplier and project-volume signal before emitting.
+
+POC DISTILLATION:
+findings.pocs contains raw POC candidates from Stage 1 research. Distill into the final poc_research array (max 3):
+  - Deduplicate (same person mentioned by multiple sources merges into one entry, source becomes a comma-separated list).
+  - Drop confidence=low entries UNLESS the company is very small AND these are the only names available (a low-confidence owner name is still useful for name-dropping at a 5-person shop).
+  - Preserve phone, email, linkedin_url verbatim from the raw findings — do not invent or modify.
+  - Order entries by seniority: Owner / Principal / President / CEO first, then VP / Director / GM / COO, then ops/field leadership.
+  - Skip the lead-form contact themselves (they live separately in the brief's contact_info section).
+  - For each POC, write a useful 1-line name_drop_hook if Stage 1 surfaced any specific context (recent press, co-founder relationship, public quote, alma mater, prior employer overlap with TerraGenie team). Empty string if no specific hook is available; do not fabricate hooks.
+  - If findings.pocs is empty or returns no POCs that pass the gate, emit poc_research as an empty array. Stage 3 will render a "no additional POCs found" note in the brief.
 6. Compute business standard field values from discovered website / address / phone / description. Only include fields you confidently want to write. Stage 3 skips empties.
 7. If the research provided name_correction_candidates with medium-or-high confidence, populate name_corrections. Always apply Title Case fixes for all-lower or ALL-CAPS names.
 8. Generate the pre-call brief sections matching the classification:
@@ -1220,10 +1329,13 @@ function buildFailureEnrichment({ findings, partialAssistantText, contactRecord,
   return {
     classification: 'failure',
     icp_score: 0,
+    icp_score_d2d: 0,
+    icp_score_d2d_breakdown: 'Not scored, insufficient data to compute D2D fit.',
     confidence_level: 'Very Low',
     icp_segment: 'Enrichment Failed',
     engagement_signal: '',
-    icp_scoring_breakdown: 'Not scored — insufficient data.',
+    icp_scoring_breakdown: 'Not scored, insufficient data.',
+    poc_research: [],
     name_corrections: {},
     contact_fields: {
       enrichment_status: 'Enrichment Failed',
