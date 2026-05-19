@@ -702,7 +702,7 @@ B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
 
    Layer 1 — base fit (0-65 points):
      Project volume signal (0-30): mid-volume sweet spot (10-100 homes/yr residential OR 5+ commercial projects/yr) scores full. Tiny (<10 homes/yr) scores low. Giants score low here too. Inferred from revenue + size when not stated explicitly.
-     Decision-maker accessibility (0-20): owner/principal findable = full. Multi-layer org with gatekeeper = low. Lead-form contact is a real decision-maker = bonus.
+     Decision-maker accessibility (0-20): owner/principal findable = full. Multi-layer org with gatekeeper = low. Lead-form contact is a real decision-maker = bonus. CAP: when the company is "too small to support recurring TerraGenie use" (sub-10-homes/yr residential, boutique micro shops with no project pipeline), cap dm_pts at 15/20 max. Reachability does not matter if the buyer cannot justify the tool — do not let easy DM access inflate the D2D score for shapes that lack commercial viability.
      Business operational complexity (0-15): companies whose work requires field layout regularly (commercial GC, heavy civil, utility, high-end residential, large-scale landscape) score full. Mow-and-blow landscapers, pure interior-only finish work, pure paperwork brokers score low.
 
    Layer 2 — business-type multiplier (apply to base_fit before adding drive points; clamp to 0-65):
@@ -712,7 +712,7 @@ B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
      0.95x  Utility contractor (water/sewer/gas) in size sweet spot
      0.85x  High-end landscape design / hardscape (NOT general mow-and-blow)
      0.75x  Pool / outdoor structure builder (size sweet spot)
-     0.40x  Small residential GC (<10 homes/yr)
+     0.25x  Small residential GC (<10 homes/yr) — boutique builders, owner-operator with low project volume; multiplier is aggressive because a low-volume buyer cannot justify recurring TerraGenie use even when geographically close
      0.30x  Enterprise GC (200+ employees, multi-state, deep org chart) — too big for D2D motion
      0.10x  General landscaping (mow-and-blow / lawn maintenance)
      0.00x  Out of vertical (property management, insurance, retail, etc.)
@@ -809,9 +809,12 @@ ABSOLUTE FORMULA DISCIPLINE (CRITICAL — your single most important rule):
     1. State your four factor values: volume_pts = ?, dm_pts = ?, complexity_pts = ?, multiplier = ?
     2. Compute layer1 = round((volume_pts + dm_pts + complexity_pts) × multiplier) to nearest integer
     3. Add drive_data.d2d_points_from_distance verbatim
-    4. Clamp 0-100
-    5. Emit that exact number.
-    6. If a different number "feels right", your factor values are wrong. Revise the factor values within their legitimate ranges, recompute, emit the new strict result. Never patch the final number directly.
+    4. Clamp 0-100. Call this integer FINAL.
+    5. Write FINAL into the icp_score_d2d_breakdown text as the final clause: "...icp_score_d2d = clamp(layer1+drive, 0, 100) = FINAL".
+    6. Write FINAL into the icp_score_d2d field. The integer in icp_score_d2d MUST equal FINAL exactly. If you wrote one number in your breakdown text and a different number in the icp_score_d2d field, you have failed the pre-flight — fix it before emitting.
+    7. If a different number "feels right", your factor values are wrong. Revise factor values within their legitimate ranges, recompute, update BOTH the breakdown text AND the field. Never let them diverge.
+
+  CRITICAL — RECENT FAILURE MODE OBSERVED: the model wrote "Emitting 51" in the breakdown text but set icp_score_d2d=68 in the structured field. They MUST match. If your breakdown text concludes "Emitting X" or "= X" for the final score, the icp_score_d2d field MUST contain exactly X. Cross-check before finishing the emit_enrichment call.
 
 CALIBRATION GROUND-TRUTH (use these to CHECK your factor inputs, not to override your output):
   Ideal D2D, expected D2D 85-100, Revenue 70-90:
