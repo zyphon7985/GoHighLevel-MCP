@@ -1282,20 +1282,25 @@ async function computeDriveData(findings, businessRecord) {
     return { ...baseSkipped, skipped_reason: 'no_address' };
   }
   try {
-    // Two-step lookup so we can distinguish geocode failure from ORS failure
-    const { geocodeAddress, getDriveRoute, getOriginCoords } = require('./_maps');
-    const destCoords = await geocodeAddress(resolved.address);
-    if (!destCoords) {
-      console.log(`[drive-time] geocode failed for "${resolved.address}"`);
+    // Two-step lookup so we can distinguish geocode failure from ORS failure.
+    // geocodeAddressWithMeta runs the cascade (full address → suite-stripped
+    // → city+state+zip → city+state → zip → state) so we get coords for
+    // virtually any address with a city/state hint. Cascade level + confidence
+    // get passed through to synthesis so the brief can note when the drive
+    // is a city-level estimate rather than precise street geocode.
+    const { geocodeAddressWithMeta, getDriveRoute, getOriginCoords } = require('./_maps');
+    const geocodeResult = await geocodeAddressWithMeta(resolved.address);
+    if (!geocodeResult) {
+      console.log(`[drive-time] geocode cascade exhausted for "${resolved.address}"`);
       return { ...baseSkipped, skipped_reason: 'geocode_failed' };
     }
-    const route = await getDriveRoute(getOriginCoords(), destCoords);
+    const route = await getDriveRoute(getOriginCoords(), geocodeResult.coords);
     if (!route) {
       console.log(`[drive-time] ORS route failed for "${resolved.address}" (coords resolved ok)`);
       return { ...baseSkipped, skipped_reason: 'ors_route_failed' };
     }
     const points = driveTimeToD2DPoints(route.duration_minutes);
-    console.log(`[drive-time] "${resolved.address}" -> ${route.duration_minutes}min, ${route.distance_miles}mi, tier=${points}`);
+    console.log(`[drive-time] "${resolved.address}" -> ${route.duration_minutes}min, ${route.distance_miles}mi, tier=${points}, geocode_level=${geocodeResult.level}`);
     return {
       drive_time_minutes: route.duration_minutes,
       distance_miles: route.distance_miles,
@@ -1303,6 +1308,9 @@ async function computeDriveData(findings, businessRecord) {
       hq_address_resolved: resolved.address,
       hq_address_source: resolved.source,
       hq_address_confidence: resolved.confidence,
+      geocode_used_query: geocodeResult.used_query,
+      geocode_level: geocodeResult.level,
+      geocode_confidence: geocodeResult.confidence,
       skipped_reason: null
     };
   } catch (err) {

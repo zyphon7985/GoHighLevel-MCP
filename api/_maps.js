@@ -84,53 +84,201 @@ function cleanAddressForGeocoding(addressString) {
   return out;
 }
 
-// Geocode a free-form address string to [longitude, latitude].
-// Tries the address as-given first, then a cleaned version with suite/unit
-// modifiers stripped (Nominatim free tier limitation workaround).
-// Returns null on failure or no match.
+// Single-shot geocode attempt against Nominatim. Internal helper used by
+// geocodeAddress (cascade). Returns [lon, lat] or null.
+async function geocodeAddressOnce(query) {
+  if (!query || typeof query !== 'string' || query.trim().length === 0) return null;
+  const url = `${NOMINATIM_SEARCH_URL}?q=${encodeURIComponent(query)}&format=json&limit=1&countrycodes=us`;
+  try {
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': NOMINATIM_USER_AGENT,
+        'Accept': 'application/json'
+      }
+    });
+    if (!res.ok) {
+      console.warn(`[maps] nominatim status=${res.status} for "${query.substring(0, 80)}"`);
+      return null;
+    }
+    const arr = await res.json();
+    if (!Array.isArray(arr) || arr.length === 0) {
+      return null; // no match (not a hard failure)
+    }
+    const lat = parseFloat(arr[0].lat);
+    const lon = parseFloat(arr[0].lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+      return null;
+    }
+    return [lon, lat];
+  } catch (err) {
+    console.warn(`[maps] nominatim threw on "${query.substring(0, 80)}": ${err.message}`);
+    return null;
+  }
+}
+
+// Best-effort extraction of address parts from a free-form US address string.
+// Recognized shapes:
+//   "1234 Main St, Oviedo, FL 32765"  → street + city + state + zip
+//   "Oviedo, FL 32765"                → city + state + zip
+//   "Oviedo, FL"                       → city + state
+//   "FL"                                → state
+// Best-effort extraction. Handles 2-letter state abbreviations AND full
+// state names ("Florida" → "FL"). US states only.
+const US_STATE_NAME_TO_ABBR = {
+  alabama:'AL', alaska:'AK', arizona:'AZ', arkansas:'AR', california:'CA',
+  colorado:'CO', connecticut:'CT', delaware:'DE', florida:'FL', georgia:'GA',
+  hawaii:'HI', idaho:'ID', illinois:'IL', indiana:'IN', iowa:'IA', kansas:'KS',
+  kentucky:'KY', louisiana:'LA', maine:'ME', maryland:'MD', massachusetts:'MA',
+  michigan:'MI', minnesota:'MN', mississippi:'MS', missouri:'MO', montana:'MT',
+  nebraska:'NE', nevada:'NV', 'new hampshire':'NH', 'new jersey':'NJ',
+  'new mexico':'NM', 'new york':'NY', 'north carolina':'NC',
+  'north dakota':'ND', ohio:'OH', oklahoma:'OK', oregon:'OR',
+  pennsylvania:'PA', 'rhode island':'RI', 'south carolina':'SC',
+  'south dakota':'SD', tennessee:'TN', texas:'TX', utah:'UT', vermont:'VT',
+  virginia:'VA', washington:'WA', 'west virginia':'WV', wisconsin:'WI',
+  wyoming:'WY', 'district of columbia':'DC', dc:'DC'
+};
+function normalizeStateToken(token) {
+  if (!token) return null;
+  const t = token.trim().toLowerCase();
+  if (/^[a-z]{2}$/i.test(t)) return t.toUpperCase();
+  return US_STATE_NAME_TO_ABBR[t] || null;
+}
+
+function extractAddressParts(addr) {
+  if (!addr || typeof addr !== 'string') return {};
+  const parts = { street: null, city: null, state: null, zip: null };
+  const cleaned = addr.trim().replace(/\bUSA\b/i, '').replace(/,\s*$/, '').trim();
+
+  // Zip (5 digits, optional 5-4)
+  const zipMatch = cleaned.match(/\b(\d{5}(?:-\d{4})?)\b/);
+  if (zipMatch) parts.zip = zipMatch[1];
+
+  // State: prefer 2-letter abbreviation at end. If absent, try full state name.
+  let stateMatch = cleaned.match(/,?\s*([A-Z]{2})\b(?:\s+\d{5}(?:-\d{4})?)?\s*$/);
+  if (stateMatch) {
+    parts.state = stateMatch[1].toUpperCase();
+  } else {
+    // Try full state name, possibly followed by zip: "Oviedo, Florida" or "Bradenton, Florida 34209"
+    for (const [name, abbr] of Object.entries(US_STATE_NAME_TO_ABBR)) {
+      const re = new RegExp(`,?\\s*${name.replace(/ /g, '\\s+')}\\b(?:\\s+\\d{5}(?:-\\d{4})?)?\\s*$`, 'i');
+      if (re.test(cleaned)) {
+        parts.state = abbr;
+        break;
+      }
+    }
+  }
+
+  // City: token between last two commas before state, e.g. "Street, City, ST..."
+  // Or first token if no street: "City, ST..."
+  const segments = cleaned.split(',').map(s => s.trim()).filter(Boolean);
+  if (segments.length >= 2 && parts.state) {
+    // Find segment whose token (after stripping zip) equals state abbr OR full name
+    let stateIdx = -1;
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const seg = segments[i].replace(/\s+\d{5}(?:-\d{4})?\s*$/, '').trim();
+      if (normalizeStateToken(seg) === parts.state) { stateIdx = i; break; }
+    }
+    if (stateIdx >= 1) {
+      parts.city = segments[stateIdx - 1];
+    }
+    if (stateIdx >= 2) {
+      parts.street = segments.slice(0, stateIdx - 1).join(', ');
+    }
+  }
+
+  return parts;
+}
+
+// Build the geocoding cascade for a single input address. Each entry is
+// tried in order until one returns coords. Confidence reflects how much
+// precision was preserved.
+//
+// Cascade levels (most → least specific):
+//   0 = original full address              (confidence: high)
+//   1 = suite-stripped full address        (confidence: high)
+//   2 = street + city + state (no zip)     (confidence: high)
+//   3 = city + state + zip                 (confidence: medium)
+//   4 = city + state                       (confidence: medium)
+//   5 = zip only                           (confidence: low)
+//   6 = state only                         (confidence: very_low — center of state)
+function buildGeocodeCascade(addressString) {
+  const attempts = [];
+  const seen = new Set();
+  const add = (query, level, confidence) => {
+    if (!query) return;
+    const q = query.trim();
+    if (!q || seen.has(q.toLowerCase())) return;
+    seen.add(q.toLowerCase());
+    attempts.push({ query: q, level, confidence });
+  };
+
+  const original = (addressString || '').trim();
+  const cleaned = cleanAddressForGeocoding(original);
+  const parts = extractAddressParts(original);
+
+  // Level 0: original
+  add(original, 0, 'high');
+  // Level 1: suite-stripped
+  if (cleaned && cleaned !== original) add(cleaned, 1, 'high');
+  // Level 2: street + city + state (no zip)
+  if (parts.street && parts.city && parts.state) {
+    add(`${parts.street}, ${parts.city}, ${parts.state}`, 2, 'high');
+  }
+  // Level 3: city + state + zip
+  if (parts.city && parts.state && parts.zip) {
+    add(`${parts.city}, ${parts.state} ${parts.zip}`, 3, 'medium');
+  }
+  // Level 4: city + state
+  if (parts.city && parts.state) {
+    add(`${parts.city}, ${parts.state}`, 4, 'medium');
+  }
+  // Level 5: zip only (gives a centroid)
+  if (parts.zip) {
+    add(parts.zip, 5, 'low');
+  }
+  // Level 6: state only (very rough centroid)
+  if (parts.state) {
+    add(parts.state, 6, 'very_low');
+  }
+  return attempts;
+}
+
+// Geocode a free-form address string with a cascading fallback.
+// Returns [lon, lat] or null. (For confidence / used_query / level metadata,
+// see geocodeAddressWithMeta below.)
 async function geocodeAddress(addressString) {
+  const result = await geocodeAddressWithMeta(addressString);
+  return result ? result.coords : null;
+}
+
+// Geocode with full metadata. Use this when you care which cascade level
+// produced the match (e.g. to flag low-precision drive estimates).
+// Returns { coords, used_query, level, confidence } or null.
+async function geocodeAddressWithMeta(addressString) {
   if (!addressString || typeof addressString !== 'string' || addressString.trim().length === 0) {
     return null;
   }
-  const original = addressString.trim();
-  const cleaned = cleanAddressForGeocoding(original);
-  const attempts = cleaned && cleaned !== original ? [original, cleaned] : [original];
-
-  for (const q of attempts) {
-    const url = `${NOMINATIM_SEARCH_URL}?q=${encodeURIComponent(q)}&format=json&limit=1&countrycodes=us`;
-    try {
-      const res = await fetch(url, {
-        headers: {
-          'User-Agent': NOMINATIM_USER_AGENT,
-          'Accept': 'application/json'
-        }
-      });
-      if (!res.ok) {
-        console.warn(`[maps] nominatim status=${res.status} for "${q.substring(0, 80)}"`);
-        continue;
+  const attempts = buildGeocodeCascade(addressString);
+  const tried = [];
+  for (const attempt of attempts) {
+    tried.push(`[${attempt.level}] "${attempt.query.substring(0, 60)}"`);
+    const coords = await geocodeAddressOnce(attempt.query);
+    if (coords) {
+      if (attempt.level > 0) {
+        console.log(`[maps] geocoded via cascade level ${attempt.level} (confidence=${attempt.confidence}): "${(addressString || '').substring(0, 60)}" -> "${attempt.query.substring(0, 60)}"`);
       }
-      const arr = await res.json();
-      if (!Array.isArray(arr) || arr.length === 0) {
-        console.warn(`[maps] nominatim no match for "${q.substring(0, 80)}"`);
-        // brief sleep before retry attempt to be polite to Nominatim
-        if (attempts.length > 1) await new Promise(r => setTimeout(r, 200));
-        continue;
-      }
-      const lat = parseFloat(arr[0].lat);
-      const lon = parseFloat(arr[0].lon);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-        console.warn(`[maps] nominatim returned non-numeric coords for "${q.substring(0, 80)}"`);
-        continue;
-      }
-      if (q !== original) {
-        console.log(`[maps] geocoded via cleaned fallback: "${original.substring(0, 60)}" -> "${q.substring(0, 60)}"`);
-      }
-      return [lon, lat];
-    } catch (err) {
-      console.warn(`[maps] nominatim threw on "${q.substring(0, 80)}": ${err.message}`);
-      continue;
+      return {
+        coords,
+        used_query: attempt.query,
+        level: attempt.level,
+        confidence: attempt.confidence
+      };
     }
+    // Be polite to Nominatim between attempts (free tier policy)
+    if (attempts.length > 1) await new Promise(r => setTimeout(r, 250));
   }
+  console.warn(`[maps] geocode cascade exhausted for "${(addressString || '').substring(0, 60)}". Tried: ${tried.join(', ')}`);
   return null;
 }
 
@@ -243,11 +391,14 @@ function driveTimeToD2DPoints(minutes) {
 
 module.exports = {
   geocodeAddress,
+  geocodeAddressWithMeta,
   getDriveRoute,
   getDriveFromTerraGenieHQ,
   driveTimeToD2DPoints,
   getOriginCoords,
   cleanAddressForGeocoding,
+  extractAddressParts,
+  buildGeocodeCascade,
   // Exposed for testing / direct use
   ORIGIN_ADDRESS,
   HQ_COORDS_HARDCODED,
