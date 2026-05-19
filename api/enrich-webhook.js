@@ -468,17 +468,28 @@ const EMIT_ENRICHMENT_TOOL = {
         type: 'integer',
         minimum: 0,
         maximum: 100,
-        description: 'REVENUE/OPPORTUNITY FIT score (0-100). "How big a win if we land them, ignoring sales-cycle difficulty and geography." Heavy weight on revenue tier, deal-size potential, decision-maker access. NO geography weighting (geography lives in icp_score_d2d). Enterprise GCs that are sales-cycle nightmares can still score 90+ here because the dollar value of landing them is huge.'
+        description: 'REVENUE/OPPORTUNITY FIT score (0-100). DEPRECATED FOR DIRECT EMISSION: Stage 3 now computes this from revenue_factors. Echo the value you expect (sum of revenue_factors) here for the schema validator, but Stage 3 will override with the deterministic computation. Just emit the formula result you would have computed: industry_pts + revenue_potential_pts + dm_access_pts + size_pts + digital_pts, clamped to 0-100.'
       },
       icp_score_d2d: {
         type: 'integer',
         minimum: 0,
         maximum: 100,
-        description: 'DOOR-TO-DOOR FIT score (0-100). "Should a TerraGenie rep drive there and knock?" Heavy weight on driving distance from HQ + business-type taxonomy + project-volume sweet spot. ENTERPRISE GCs score LOW here even if revenue potential is huge — too many decision-makers, too long a cycle for D2D motion. Computation: start from base fit (business type + project volume + decision-maker accessibility, scored 0-65), apply business-type multiplier (1.0 for sweet-spot builders down to 0.0 for out-of-vertical), then ADD the drive-time tier points from drive_data.d2d_points_from_distance (range -20 to +35). Clamp final to 0-100. If drive_data.drive_time_minutes is null, set the geography component to 0 and note "drive time unavailable" in icp_score_d2d_breakdown.'
+        description: 'DEPRECATED FOR DIRECT EMISSION: Stage 3 now computes this from d2d_factors + drive_data. Echo the value you expect here for backward-compat (round((volume_pts + dm_pts + complexity_pts) × multiplier) + drive_data.d2d_points_from_distance, clamped 0-100), but Stage 3 will override with the deterministic computation. This emission is only used as a fallback if d2d_factors are absent.'
+      },
+      d2d_factors: {
+        type: 'object',
+        description: 'D2D scoring inputs. You pick the four factor values; Stage 3 code computes the final icp_score_d2d deterministically from these factors and drive_data. This is the structured replacement for picking icp_score_d2d directly. Picking the factors is your job; computing the score is the code\'s job. Aim for factor values that legitimately reflect this contact, not values reverse-engineered to hit a target score.',
+        properties: {
+          volume_pts: { type: 'integer', minimum: 0, maximum: 30, description: 'Project volume signal (0-30). Sweet spot: mid-volume (10-100 homes/yr residential OR 5+ commercial projects/yr) scores 18-26. Tiny (<10 homes/yr) scores low (3-10). Giants score low here too (5-15 — high volume but not D2D-actionable). Infer from revenue + size + project portfolio. Unproven startups: score 8-15 (some uncertainty discount).' },
+          dm_pts: { type: 'integer', minimum: 0, maximum: 20, description: 'Decision-maker accessibility (0-20). Owner/principal directly reachable = 18-20. Multi-layer org with gatekeeper = 3-8. Lead-form contact is a real decision-maker = bonus. CAP at 15/20 when company is "too small to support recurring TerraGenie use" (sub-10-homes/yr residential micro shops), regardless of how reachable the owner is.' },
+          complexity_pts: { type: 'integer', minimum: 0, maximum: 15, description: 'Business operational complexity (0-15). Commercial GC / heavy civil / utility contractor / large landscape design / high-end residential = 13-15 (layout on every project). Pool builders / pure interior finish = 5-10. Mow-and-blow landscapers / paperwork brokers = 0-3.' },
+          multiplier: { type: 'number', minimum: 0, maximum: 1.0, description: 'Business-type multiplier applied to (volume_pts + dm_pts + complexity_pts). 1.00 = Mid-size residential builder (10-100 homes/yr), mid-size commercial contractor (5+ projects/yr), heavy civil / site work in sweet spot. 0.95 = Utility contractor (water/sewer/gas) in sweet spot. 0.85 = High-end landscape design / hardscape. 0.75 = Pool / outdoor structure. 0.25 = Small residential GC (<10 homes/yr) — boutique. 0.30 = Enterprise GC (200+ employees, multi-state). 0.10 = General mow-and-blow landscaping. 0.00 = Out of vertical.' }
+        },
+        required: ['volume_pts', 'dm_pts', 'complexity_pts', 'multiplier']
       },
       icp_score_d2d_breakdown: {
         type: 'string',
-        description: 'Factor-by-factor breakdown of the D2D score. Example: "Drive 25min/+35 (Orlando metro); Business type 1.0x (mid-size residential builder); Volume signal 20/25 (30-50 homes/yr est); Decision-maker accessibility 10/15 (owner findable); Size penalty 0 (right band)". Stage 3 renders this in the brief next to the score.'
+        description: 'Plain-prose factor-by-factor description for the brief. State each factor value with one-line justification. Example: "Drive 25min/+35 (Orlando metro); Volume 20/30 (30-50 homes/yr est); DM 18/20 (owner found); Complexity 15/15 (commercial GC); Multiplier 1.0x (sweet-spot mid-size)". The final score is computed deterministically from d2d_factors + drive_data by Stage 3 code; do not state a final number in this text — Stage 3 appends it. Just describe the factors you picked.'
       },
       confidence_level: { type: 'string', enum: ['High', 'Medium', 'Low', 'Very Low'] },
       icp_segment: {
@@ -486,9 +497,21 @@ const EMIT_ENRICHMENT_TOOL = {
         description: 'Per Phase 6 Step 4. Use the dash form exactly as defined in the skill (e.g. "Primary - Civil/Construction", "Partner - Technology Vendor", "Low Fit - Property Management").'
       },
       engagement_signal: { type: 'string', description: 'One-liner per Phase 6 Step 5.' },
+      revenue_factors: {
+        type: 'object',
+        description: 'Revenue/opportunity scoring inputs. You pick the five factor values; Stage 3 code computes the final icp_score (revenue) deterministically by summing them (max 100). This is the structured replacement for picking icp_score directly.',
+        properties: {
+          industry_pts: { type: 'integer', minimum: 0, maximum: 35, description: 'Industry fit / TerraGenie use case (0-35). Construction-adjacent verticals with layout/grade-check needs = 30-35. Adjacent (RE Development with self-perform GC) = 25-30. Non-fit verticals = 0-10.' },
+          revenue_potential_pts: { type: 'integer', minimum: 0, maximum: 25, description: 'Revenue potential (0-25). Higher revenue / larger projects = higher. Unknown revenue but visible large-project signal = mid-tier (10-18). Micro shop with no signal = 0-5.' },
+          dm_access_pts: { type: 'integer', minimum: 0, maximum: 20, description: 'Decision-maker access (0-20). Senior decision-maker with verified channel = 18-20. Gatekeeper-only or unknown = 5-10. Director-level technical influencer (not economic buyer) at enterprise = 8-12.' },
+          size_pts: { type: 'integer', minimum: 0, maximum: 15, description: 'Company size signal (0-15). Mid-market and up = 10-15. Enterprise 200+ = 8-15 (right size for big deal but complex sales cycle). Nano-shops (sub-10 employees) = 3-7.' },
+          digital_pts: { type: 'integer', minimum: 0, maximum: 10, description: 'Digital presence / discoverability (0-10). Mature website + LinkedIn + press = 8-10. Placeholder website + thin online = 1-4.' }
+        },
+        required: ['industry_pts', 'revenue_potential_pts', 'dm_access_pts', 'size_pts', 'digital_pts']
+      },
       icp_scoring_breakdown: {
         type: 'string',
-        description: 'Factor-by-factor breakdown of the REVENUE score. Example: "Industry 35/35 (Construction); Decision Maker 15/15 (CEO); Company Size 12/15 (Mid-market 50-200); Revenue Potential 25/30 ($10M-$50M est); Digital Presence 5/5 (Full website)". Used by Stage 3 in the brief alongside icp_score_d2d_breakdown.'
+        description: 'Plain-prose description of revenue factor values for the brief. Example: "Industry 35/35 (Construction commercial GC); Revenue potential 20/25 ($10M-$50M est); DM access 15/20 (owner verified); Size 12/15 (mid-market 50-200); Digital 8/10 (full site)". The final icp_score is computed deterministically from revenue_factors by Stage 3; do not state a final number — Stage 3 appends it.'
       },
       est_drive_time_min: {
         type: 'integer',
@@ -589,7 +612,7 @@ const EMIT_ENRICHMENT_TOOL = {
         required: ['who', 'opening_angles']
       }
     },
-    required: ['classification', 'icp_score', 'icp_score_d2d', 'confidence_level', 'icp_segment', 'contact_fields', 'brief']
+    required: ['classification', 'icp_score', 'icp_score_d2d', 'd2d_factors', 'revenue_factors', 'confidence_level', 'icp_segment', 'contact_fields', 'brief']
   }
 };
 
@@ -667,10 +690,12 @@ function buildSynthesisSystemPrompt() {
 
 Steps to perform, in order:
 1. Classify: customer, partner, low_fit, or failure. Use Stage 1's classification_intent as the starting point; refine only if data warrants. (Skill Phase 6 has the classification gate detail; Stage 1 has already pre-classified.)
-2. Compute BOTH ICP scores per the "DUAL ICP SCORING" section:
-   - icp_score: 0-100, REVENUE/OPPORTUNITY fit only, no geography weighting
-   - icp_score_d2d: 0-100, DOOR-TO-DOOR fit, geo-dominant
-   Then set confidence_level (High / Medium / Low / Very Low) to reflect the WEAKER of the two scores' supporting data. Important: confidence_level is a SEPARATE METADATA FIELD; it does NOT discount either score number. Score numbers are pure formula results.
+2. Pick FACTOR VALUES, not final scores. Stage 3 code computes both ICP scores from your factors deterministically:
+   - Pick d2d_factors: { volume_pts (0-30), dm_pts (0-20), complexity_pts (0-15), multiplier (0.0-1.0) }. Code computes icp_score_d2d = clamp(round((v+d+c)*m) + drive_data.d2d_points_from_distance, 0, 100).
+   - Pick revenue_factors: { industry_pts (0-35), revenue_potential_pts (0-25), dm_access_pts (0-20), size_pts (0-15), digital_pts (0-10) }. Code computes icp_score = clamp(sum, 0, 100).
+   You DO NOT pick the final scores; you pick the factor inputs. If you think a score should be higher or lower, adjust the FACTOR VALUES within their legitimate ranges, not the final number. The code will run the math.
+   Also echo icp_score and icp_score_d2d at the top level for schema compat — set them to the same value your factors would produce. Stage 3 ignores these emitted top-level scores and uses the computed values; they exist only as a fallback if factors are absent.
+   Set confidence_level (High / Medium / Low / Very Low) based on data completeness of the two factor sets. confidence_level is METADATA; it does NOT discount either score.
 3. Set icp_segment using the dash form (e.g., "Primary - Civil/Construction", "Partner - Technology Vendor", "Low Fit - Property Management"). Self-performing GC rule: if the company runs a self-performing construction division (their own in-house crews build the sites), classify as Primary - Civil/Construction regardless of corporate parent's headline industry. The self-performing division IS a construction GC, and that is what matters for TerraGenie.
 4. Populate icp_scoring_breakdown (revenue) AND icp_score_d2d_breakdown (D2D) with one-line per-factor explanations.
 5. Echo est_drive_time_min = drive_data.drive_time_minutes (rounded to integer). Omit entirely if drive_data.drive_time_minutes is null. Do NOT emit 0.
@@ -754,12 +779,17 @@ B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
 
    When drive_data is unavailable (skipped_reason non-null): drive_points = 0 (NOT -20). Add "drive time unavailable, geo-blind D2D score" to icp_score_d2d_breakdown. Omit est_drive_time_min entirely from emit_enrichment.
 
-ABSOLUTE FORMULA DISCIPLINE (CRITICAL — your single most important rule):
+FACTOR-PICKING DISCIPLINE (CRITICAL — replaces the old formula-discipline section):
 
-  Emitted icp_score_d2d MUST exactly equal:
-    clamp((volume_pts + dm_pts + complexity_pts) × multiplier + drive_data.d2d_points_from_distance, 0, 100)
+  You no longer pick the final icp_score_d2d. Stage 3 code computes it from your d2d_factors. Same for icp_score from revenue_factors. Your job is to pick honest factor values within their legitimate ranges.
 
-  No post-formula adjustments. Not for calibration. Not for "conservatism". Not for confidence. Not because drive failed. Not because the gut says different. The strict math result IS the answer.
+  Where to express judgment:
+    Uncertain about volume? → lower volume_pts (e.g. 12 instead of 20)
+    Company looks small/startup? → lower volume_pts and/or dm_pts
+    Data is thin? → lower the affected factor
+    Drive resolved as 0 (failed lookup)? → drive_points = 0 (verbatim from drive_data); the geo-blind result is the intended signal, not something to compensate for in factors
+
+  Each factor has a legitimate range. Pick a value in range, justify it in icp_score_d2d_breakdown (factor-by-factor prose), and trust the code to compute the final score.
 
   WHERE TO EXPRESS UNCERTAINTY (this is the key — re-read it):
     Uncertain about volume? → pick a LOWER volume_pts (e.g. 12/30 instead of 20/30). The formula then naturally yields a lower score.
@@ -769,52 +799,25 @@ ABSOLUTE FORMULA DISCIPLINE (CRITICAL — your single most important rule):
 
   Each factor has a legitimate range (volume 0-30, dm 0-20, complexity 0-15). Pick a value in range. Trust the math. Stop adjusting.
 
-  THREE FUDGING PATTERNS — VERBATIM QUOTES FROM PRIOR BROKEN RUNS — NEVER REPEAT:
+  WORKED EXAMPLES — factor picks for common shapes (Stage 3 derives the final score from these):
 
-    Pattern A — upward override toward calibration band:
-      Forbidden quote: "Strict formula = 53. Emitting 83 to land in calibration band."
-      Why broken: the band is a sanity check on your factor inputs, never a target.
+    Sweet-spot builder (mature, Phil Kean shape — mid-size luxury custom-home GC, Orlando area):
+      d2d_factors: { volume_pts: 20, dm_pts: 18, complexity_pts: 15, multiplier: 1.00 }
+      (Stage 3 + drive: 53 × 1.0 + 35 = 88)
 
-    Pattern B — downward "conservative" adjustment after strict formula:
-      Forbidden quote: "Base 50 × 1.00 = 50; +35 drive = 85; clamped to 83 reflecting low unit-volume signal."
-      Forbidden quote: "Strict formula = 85; emitting 83 after conservative volume factor re-check."
-      Forbidden quote: "Base = 53; +35 drive = 88; clamped to 83 reflecting low unit-volume signal."
-      Why broken: volume is ALREADY captured in volume_pts. Don't double-discount in the final number. If you want lower, lower volume_pts. Then 88 becomes (e.g.) 83 NATURALLY through the math.
+    Sweet-spot builder (young startup, Truemark shape — same business type but unproven volume):
+      d2d_factors: { volume_pts: 15, dm_pts: 18, complexity_pts: 15, multiplier: 1.00 }
+      (Stage 3 + drive: 48 × 1.0 + 35 = 83)
+      Volume gets a haircut because startups have no track record. Same complexity, same DM access.
 
-    Pattern C — confidence cap on the number:
-      Forbidden quote: "Strict = 87; emitting 83 to reflect Medium confidence on size/revenue factors."
-      Why broken: confidence_level is a SEPARATE METADATA FIELD. It does not modify either score number.
+    Enterprise GC (Hillpointe/DPR shape):
+      d2d_factors: { volume_pts: 10, dm_pts: 5, complexity_pts: 13, multiplier: 0.30 }
+      (Stage 3 + drive: round(28 × 0.30) + 35 = 8 + 35 = 43)
 
-  WORKED EXAMPLES (these emit clean, no fudging):
-
-    Sweet-spot builder (e.g. Phil Kean shape: mid-size luxury custom-home GC, Orlando area):
-      volume_pts = 20 (3-10 high-value builds/yr, lower unit count balanced by high complexity per build)
-      dm_pts = 18 (VP Construction owner-adjacent, founder also reachable)
-      complexity_pts = 15 (ground-up custom on bespoke lots, full site work every project)
-      multiplier = 1.00 (sweet-spot builder)
-      drive_points = +35 (24 min, Orlando metro)
-      icp_score_d2d = clamp((20+18+15)*1.00 + 35, 0, 100) = clamp(53+35, 0, 100) = 88
-      EMIT 88. Exactly 88. Not 83. Not 85. The math says 88.
-
-    Enterprise GC (Hillpointe shape):
-      volume_pts = 10 (massive but enterprise-scale isn't D2D sweet spot)
-      dm_pts = 5 (multi-layer org, real DMs not accessible to rep)
-      complexity_pts = 13 (heavy site work)
-      multiplier = 0.30 (enterprise GC penalty)
-      drive_points = +35
-      icp_score_d2d = clamp((10+5+13)*0.30 + 35, 0, 100) = clamp(round(8.4)+35, 0, 100) = 43
-      EMIT 43. Exactly.
-
-  PRE-FLIGHT (run mentally, in order, before emitting):
-    1. State your four factor values: volume_pts = ?, dm_pts = ?, complexity_pts = ?, multiplier = ?
-    2. Compute layer1 = round((volume_pts + dm_pts + complexity_pts) × multiplier) to nearest integer
-    3. Add drive_data.d2d_points_from_distance verbatim
-    4. Clamp 0-100. Call this integer FINAL.
-    5. Write FINAL into the icp_score_d2d_breakdown text as the final clause: "...icp_score_d2d = clamp(layer1+drive, 0, 100) = FINAL".
-    6. Write FINAL into the icp_score_d2d field. The integer in icp_score_d2d MUST equal FINAL exactly. If you wrote one number in your breakdown text and a different number in the icp_score_d2d field, you have failed the pre-flight — fix it before emitting.
-    7. If a different number "feels right", your factor values are wrong. Revise factor values within their legitimate ranges, recompute, update BOTH the breakdown text AND the field. Never let them diverge.
-
-  CRITICAL — RECENT FAILURE MODE OBSERVED: the model wrote "Emitting 51" in the breakdown text but set icp_score_d2d=68 in the structured field. They MUST match. If your breakdown text concludes "Emitting X" or "= X" for the final score, the icp_score_d2d field MUST contain exactly X. Cross-check before finishing the emit_enrichment call.
+    Too small (Posada shape — boutique micro builder, sub-10-homes/yr):
+      d2d_factors: { volume_pts: 8, dm_pts: 15, complexity_pts: 13, multiplier: 0.25 }
+      (Stage 3 + drive: round(36 × 0.25) + 35 = 9 + 35 = 44)
+      dm_pts CAPPED at 15 even though Carlos is reachable (small-shop cap rule).
 
 CALIBRATION GROUND-TRUTH (use these to CHECK your factor inputs, not to override your output):
   Ideal D2D, expected D2D 85-100, Revenue 70-90:
@@ -1308,6 +1311,65 @@ async function computeDriveData(findings, businessRecord) {
   }
 }
 
+// Compute icp_score_d2d and icp_score deterministically from the factor
+// values the model emitted. This is the architectural fix for the field/text
+// mismatch bug observed during calibration — the model can write inconsistent
+// values across structured emit fields and prose breakdown text. By having
+// code derive the final scores from the model's chosen factors, the bug
+// becomes structurally impossible: there is only one source of truth (the
+// factor integers), and the math is deterministic.
+//
+// The model's directly-emitted icp_score and icp_score_d2d are kept as
+// fallbacks only — if d2d_factors or revenue_factors are absent (edge cases),
+// we fall back to the model's emitted score with a warning. Otherwise the
+// factor-derived value wins and we log when it differs.
+function recomputeScoresFromFactors(enrichment, driveData) {
+  if (!enrichment || typeof enrichment !== 'object') return enrichment;
+
+  const result = { ...enrichment };
+
+  // D2D — derive from d2d_factors + drive_data.d2d_points_from_distance
+  const d2d = enrichment.d2d_factors;
+  if (d2d && typeof d2d.volume_pts === 'number'
+        && typeof d2d.dm_pts === 'number'
+        && typeof d2d.complexity_pts === 'number'
+        && typeof d2d.multiplier === 'number') {
+    const base = d2d.volume_pts + d2d.dm_pts + d2d.complexity_pts;
+    const layer1 = Math.round(base * d2d.multiplier);
+    const drivePts = (driveData && typeof driveData.d2d_points_from_distance === 'number')
+      ? driveData.d2d_points_from_distance
+      : 0;
+    const computed = Math.max(0, Math.min(100, layer1 + drivePts));
+    if (enrichment.icp_score_d2d != null && enrichment.icp_score_d2d !== computed) {
+      console.warn(`[scores] icp_score_d2d: model emitted ${enrichment.icp_score_d2d}, code computed ${computed} from factors (volume=${d2d.volume_pts} dm=${d2d.dm_pts} complexity=${d2d.complexity_pts} ×${d2d.multiplier} +${drivePts}drive); using computed value`);
+    }
+    result.icp_score_d2d = computed;
+    result._d2d_computed_breakdown = `volume_pts=${d2d.volume_pts} + dm_pts=${d2d.dm_pts} + complexity_pts=${d2d.complexity_pts} = ${base} base, × ${d2d.multiplier} multiplier = ${layer1} layer1, + ${drivePts} drive = ${computed}`;
+  } else {
+    console.warn(`[scores] d2d_factors missing or incomplete on enrichment; falling back to model-emitted icp_score_d2d=${enrichment.icp_score_d2d}`);
+  }
+
+  // Revenue — derive from revenue_factors (simple sum, clamped 0-100)
+  const rev = enrichment.revenue_factors;
+  if (rev && typeof rev.industry_pts === 'number'
+        && typeof rev.revenue_potential_pts === 'number'
+        && typeof rev.dm_access_pts === 'number'
+        && typeof rev.size_pts === 'number'
+        && typeof rev.digital_pts === 'number') {
+    const sum = rev.industry_pts + rev.revenue_potential_pts + rev.dm_access_pts + rev.size_pts + rev.digital_pts;
+    const computed = Math.max(0, Math.min(100, sum));
+    if (enrichment.icp_score != null && enrichment.icp_score !== computed) {
+      console.warn(`[scores] icp_score: model emitted ${enrichment.icp_score}, code computed ${computed} from factors (industry=${rev.industry_pts} revenue=${rev.revenue_potential_pts} dm=${rev.dm_access_pts} size=${rev.size_pts} digital=${rev.digital_pts}); using computed value`);
+    }
+    result.icp_score = computed;
+    result._revenue_computed_breakdown = `industry=${rev.industry_pts} + revenue=${rev.revenue_potential_pts} + dm=${rev.dm_access_pts} + size=${rev.size_pts} + digital=${rev.digital_pts} = ${computed}`;
+  } else {
+    console.warn(`[scores] revenue_factors missing or incomplete on enrichment; falling back to model-emitted icp_score=${enrichment.icp_score}`);
+  }
+
+  return result;
+}
+
 // ─── Stage 2: Synthesis ────────────────────────────────────────────────────
 
 async function synthesizeEnrichment({ findings, contactId, contactRecord, businessRecord, driveData }) {
@@ -1409,10 +1471,12 @@ function buildFailureEnrichment({ findings, partialAssistantText, contactRecord,
     classification: 'failure',
     icp_score: 0,
     icp_score_d2d: 0,
+    d2d_factors: { volume_pts: 0, dm_pts: 0, complexity_pts: 0, multiplier: 0 },
     icp_score_d2d_breakdown: 'Not scored, insufficient data to compute D2D fit.',
     confidence_level: 'Very Low',
     icp_segment: 'Enrichment Failed',
     engagement_signal: '',
+    revenue_factors: { industry_pts: 0, revenue_potential_pts: 0, dm_access_pts: 0, size_pts: 0, digital_pts: 0 },
     icp_scoring_breakdown: 'Not scored, insufficient data.',
     poc_research: [],
     name_corrections: {},
@@ -1914,6 +1978,12 @@ async function runEnrichment(contactId) {
       error: research.error
     });
   }
+
+  // Architectural fix: deterministically compute icp_score and icp_score_d2d
+  // from the factor values the model emitted. This eliminates the field/text
+  // mismatch class of bugs. The model's directly-emitted score numbers are
+  // kept as fallbacks only.
+  enrichment = recomputeScoresFromFactors(enrichment, driveData);
 
   // Stage 3: writeback (deterministic, runs even on the failure path).
   let writeback;
