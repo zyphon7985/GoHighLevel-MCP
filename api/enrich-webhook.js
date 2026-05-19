@@ -754,21 +754,64 @@ B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
 
    When drive_data is unavailable (skipped_reason non-null): drive_points = 0 (NOT -20). Add "drive time unavailable, geo-blind D2D score" to icp_score_d2d_breakdown. Omit est_drive_time_min entirely from emit_enrichment.
 
-ABSOLUTE FORMULA DISCIPLINE (CRITICAL):
+ABSOLUTE FORMULA DISCIPLINE (CRITICAL — your single most important rule):
 
-  Emitted icp_score_d2d MUST equal:
+  Emitted icp_score_d2d MUST exactly equal:
     clamp((volume_pts + dm_pts + complexity_pts) × multiplier + drive_data.d2d_points_from_distance, 0, 100)
 
-  No exceptions. Not when drive_data failed. Not when the company is in your calibration ground truth. Not when you "know" the right answer is higher. Not because of confidence_level. The number is the formula result.
+  No post-formula adjustments. Not for calibration. Not for "conservatism". Not for confidence. Not because drive failed. Not because the gut says different. The strict math result IS the answer.
 
-  drive_data.d2d_points_from_distance is the drive component, read verbatim. If drive_data.skipped_reason is non-null, drive_points = 0 and the D2D score will be lower than the "true" geographic score — that is the INTENDED behavior, signaling missing drive data to the human reviewer. Express your judgment about what the score "would be" with drive resolved only in icp_score_d2d_breakdown TEXT, never in the NUMBER.
+  WHERE TO EXPRESS UNCERTAINTY (this is the key — re-read it):
+    Uncertain about volume? → pick a LOWER volume_pts (e.g. 12/30 instead of 20/30). The formula then naturally yields a lower score.
+    Company looks small/startup? → reflect in volume_pts and/or dm_pts. NOT in a final-score discount.
+    Data is thin? → reflect in factor pts. NOT in final number.
+    Drive resolved as 0 because of geocode failure? → drive_points = 0 (verbatim from drive_data). Note the lookup gap in the breakdown TEXT, never compensate in the NUMBER.
 
-  WRONG: Strict formula = 53. Model emits 83 with breakdown "True score likely 83+ if drive confirmed." Forbidden.
-  CORRECT: Strict formula = 53. Model emits 53 with breakdown "Drive component 0 (geocode_failed). Strict score 53. If drive had resolved (~24 min, +35 tier), strict score would be 88. Treat 53 as a floor."
+  Each factor has a legitimate range (volume 0-30, dm 0-20, complexity 0-15). Pick a value in range. Trust the math. Stop adjusting.
 
-  If your strict result feels far off the calibration band, re-examine FACTOR INPUTS (volume, DM, complexity, multiplier) within their legitimate ranges and recompute. NEVER patch the output.
+  THREE FUDGING PATTERNS — VERBATIM QUOTES FROM PRIOR BROKEN RUNS — NEVER REPEAT:
 
-  Pre-flight: (1) layer-1 = sum of 3 factor pts. (2) Apply ONE multiplier. (3) Add drive_data.d2d_points_from_distance VERBATIM. (4) Clamp 0-100. (5) Emit the math result, not your gut feel.
+    Pattern A — upward override toward calibration band:
+      Forbidden quote: "Strict formula = 53. Emitting 83 to land in calibration band."
+      Why broken: the band is a sanity check on your factor inputs, never a target.
+
+    Pattern B — downward "conservative" adjustment after strict formula:
+      Forbidden quote: "Base 50 × 1.00 = 50; +35 drive = 85; clamped to 83 reflecting low unit-volume signal."
+      Forbidden quote: "Strict formula = 85; emitting 83 after conservative volume factor re-check."
+      Forbidden quote: "Base = 53; +35 drive = 88; clamped to 83 reflecting low unit-volume signal."
+      Why broken: volume is ALREADY captured in volume_pts. Don't double-discount in the final number. If you want lower, lower volume_pts. Then 88 becomes (e.g.) 83 NATURALLY through the math.
+
+    Pattern C — confidence cap on the number:
+      Forbidden quote: "Strict = 87; emitting 83 to reflect Medium confidence on size/revenue factors."
+      Why broken: confidence_level is a SEPARATE METADATA FIELD. It does not modify either score number.
+
+  WORKED EXAMPLES (these emit clean, no fudging):
+
+    Sweet-spot builder (e.g. Phil Kean shape: mid-size luxury custom-home GC, Orlando area):
+      volume_pts = 20 (3-10 high-value builds/yr, lower unit count balanced by high complexity per build)
+      dm_pts = 18 (VP Construction owner-adjacent, founder also reachable)
+      complexity_pts = 15 (ground-up custom on bespoke lots, full site work every project)
+      multiplier = 1.00 (sweet-spot builder)
+      drive_points = +35 (24 min, Orlando metro)
+      icp_score_d2d = clamp((20+18+15)*1.00 + 35, 0, 100) = clamp(53+35, 0, 100) = 88
+      EMIT 88. Exactly 88. Not 83. Not 85. The math says 88.
+
+    Enterprise GC (Hillpointe shape):
+      volume_pts = 10 (massive but enterprise-scale isn't D2D sweet spot)
+      dm_pts = 5 (multi-layer org, real DMs not accessible to rep)
+      complexity_pts = 13 (heavy site work)
+      multiplier = 0.30 (enterprise GC penalty)
+      drive_points = +35
+      icp_score_d2d = clamp((10+5+13)*0.30 + 35, 0, 100) = clamp(round(8.4)+35, 0, 100) = 43
+      EMIT 43. Exactly.
+
+  PRE-FLIGHT (run mentally, in order, before emitting):
+    1. State your four factor values: volume_pts = ?, dm_pts = ?, complexity_pts = ?, multiplier = ?
+    2. Compute layer1 = round((volume_pts + dm_pts + complexity_pts) × multiplier) to nearest integer
+    3. Add drive_data.d2d_points_from_distance verbatim
+    4. Clamp 0-100
+    5. Emit that exact number.
+    6. If a different number "feels right", your factor values are wrong. Revise the factor values within their legitimate ranges, recompute, emit the new strict result. Never patch the final number directly.
 
 CALIBRATION GROUND-TRUTH (use these to CHECK your factor inputs, not to override your output):
   Ideal D2D, expected D2D 85-100, Revenue 70-90:
