@@ -483,7 +483,7 @@ const EMIT_ENRICHMENT_TOOL = {
           volume_pts: { type: 'integer', minimum: 0, maximum: 30, description: 'Project volume signal (0-30). Sweet spot: mid-volume (10-100 homes/yr residential OR 5+ commercial projects/yr) scores 18-26. Tiny (<10 homes/yr) scores low (3-10). Giants score low here too (5-15 — high volume but not D2D-actionable). Infer from revenue + size + project portfolio. Unproven startups: score 8-15 (some uncertainty discount).' },
           dm_pts: { type: 'integer', minimum: 0, maximum: 20, description: 'Decision-maker accessibility (0-20). Owner/principal directly reachable = 18-20. Multi-layer org with gatekeeper = 3-8. Lead-form contact is a real decision-maker = bonus. CAP at 15/20 when company is "too small to support recurring TerraGenie use" (sub-10-homes/yr residential micro shops), regardless of how reachable the owner is.' },
           complexity_pts: { type: 'integer', minimum: 0, maximum: 15, description: 'Business operational complexity (0-15). Commercial GC / heavy civil / utility contractor / large landscape design / high-end residential = 13-15 (layout on every project). Pool builders / pure interior finish = 5-10. Mow-and-blow landscapers / paperwork brokers = 0-3.' },
-          multiplier: { type: 'number', minimum: 0, maximum: 1.0, description: 'Business-type multiplier applied to (volume_pts + dm_pts + complexity_pts). 1.00 = Mid-size residential builder (10-100 homes/yr), mid-size commercial contractor (5+ projects/yr), heavy civil / site work in sweet spot. 0.95 = Utility contractor (water/sewer/gas) in sweet spot. 0.85 = High-end landscape design / hardscape. 0.75 = Pool / outdoor structure. 0.25 = Small residential GC (<10 homes/yr) — boutique. 0.30 = Enterprise GC (200+ employees, multi-state). 0.10 = General mow-and-blow landscaping. 0.00 = Out of vertical.' }
+          multiplier: { type: 'number', minimum: 0, maximum: 1.0, description: 'Business-type multiplier applied to (volume_pts + dm_pts + complexity_pts). 1.00 = Mid-size residential builder (10-100 homes/yr), mid-size commercial contractor (5+ projects/yr), heavy civil / site work in sweet spot. 0.95 = Utility contractor (water/sewer/gas) in sweet spot. 0.85 = High-end landscape design / hardscape. 0.75 = Pool / outdoor structure. 0.60 = Production homebuilder (mid-to-large family-owned, 50-300 employees, regional single-state footprint, field-heavy, owner/principal still accessible). 0.25 = Small residential GC (<10 homes/yr) — boutique. 0.30 = Enterprise GC (200+ employees, multi-state). 0.10 = General mow-and-blow landscaping. 0.00 = Out of vertical.' }
         },
         required: ['volume_pts', 'dm_pts', 'complexity_pts', 'multiplier']
       },
@@ -737,6 +737,7 @@ B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
      0.95x  Utility contractor (water/sewer/gas) in size sweet spot
      0.85x  High-end landscape design / hardscape (NOT general mow-and-blow)
      0.75x  Pool / outdoor structure builder (size sweet spot)
+     0.60x  Production homebuilder (mid-to-large family-owned, 50-300 employees, regional single-state footprint) — bigger than sweet-spot but still field-heavy and owner/principal accessible. Partial discount for higher project velocity and deeper org chart than mid-size, but distinguished from Enterprise GC by single-state footprint and family ownership keeping the decision-maker reachable.
      0.25x  Small residential GC (<10 homes/yr) — boutique builders, owner-operator with low project volume; multiplier is aggressive because a low-volume buyer cannot justify recurring TerraGenie use even when geographically close
      0.30x  Enterprise GC (200+ employees, multi-state, deep org chart) — too big for D2D motion
      0.10x  General landscaping (mow-and-blow / lawn maintenance)
@@ -818,6 +819,11 @@ FACTOR-PICKING DISCIPLINE (CRITICAL — replaces the old formula-discipline sect
       d2d_factors: { volume_pts: 8, dm_pts: 15, complexity_pts: 13, multiplier: 0.25 }
       (Stage 3 + drive: round(36 × 0.25) + 35 = 9 + 35 = 44)
       dm_pts CAPPED at 15 even though Carlos is reachable (small-shop cap rule).
+
+    Production homebuilder (Park Square shape — mid-to-large family-owned regional builder, 50-300 employees, single-state):
+      d2d_factors: { volume_pts: 22, dm_pts: 14, complexity_pts: 14, multiplier: 0.60 }
+      (Stage 3 + drive: round(50 × 0.60) + 35 = 30 + 35 = 65)
+      Volume is solid (high project velocity), DM access is moderate (family-owned keeps the principal reachable but deeper org than sweet-spot), complexity full. Use 0.60x when the shape is bigger than mid-size sweet-spot but still single-state regional with owner/principal accessibility — distinct from 0.30x Enterprise (multi-state, deep gatekeeper layers).
 
 CALIBRATION GROUND-TRUTH (use these to CHECK your factor inputs, not to override your output):
   Ideal D2D, expected D2D 85-100, Revenue 70-90:
