@@ -502,9 +502,9 @@ const EMIT_ENRICHMENT_TOOL = {
         description: 'Revenue/opportunity scoring inputs. You pick the five factor values; Stage 3 code computes the final icp_score (revenue) deterministically by summing them (max 100). This is the structured replacement for picking icp_score directly.',
         properties: {
           industry_pts: { type: 'integer', minimum: 0, maximum: 35, description: 'Industry fit / TerraGenie use case (0-35). Construction-adjacent verticals with layout/grade-check needs = 30-35. Adjacent (RE Development with self-perform GC) = 25-30. Non-fit verticals = 0-10.' },
-          revenue_potential_pts: { type: 'integer', minimum: 0, maximum: 25, description: 'Revenue potential (0-25). Higher revenue / larger projects = higher. Unknown revenue but visible large-project signal = mid-tier (10-18). Micro shop with no signal = 0-5.' },
-          dm_access_pts: { type: 'integer', minimum: 0, maximum: 20, description: 'Decision-maker access (0-20). Senior decision-maker with verified channel = 18-20. Gatekeeper-only or unknown = 5-10. Director-level technical influencer (not economic buyer) at enterprise = 8-12.' },
-          size_pts: { type: 'integer', minimum: 0, maximum: 15, description: 'Company size signal (0-15). Mid-market and up = 10-15. Enterprise 200+ = 8-15 (right size for big deal but complex sales cycle). Nano-shops (sub-10 employees) = 3-7.' },
+          revenue_potential_pts: { type: 'integer', minimum: 0, maximum: 25, description: 'Revenue potential (0-25). Higher revenue / larger projects = higher. Unknown revenue but visible large-project signal = mid-tier (10-18). Micro shop with no signal = 0-5. CAP at 8/25 when company is "too small to support recurring TerraGenie use" (sub-10-homes/yr residential micro shops, owner-operator boutique builders) — TerraGenie LTV depends on RECURRING field-tool use, not the prospect\'s gross company revenue. Symmetric to the D2D dm_pts cap: too small for D2D = too small for Revenue.' },
+          dm_access_pts: { type: 'integer', minimum: 0, maximum: 20, description: 'Decision-maker access (0-20). Senior decision-maker with verified channel = 18-20. Gatekeeper-only or unknown = 5-10. Director-level technical influencer (not economic buyer) at enterprise = 8-12. CAP at 8/20 when company is "too small to support recurring TerraGenie use" (sub-10-homes/yr residential micro shops) — reachability does not equal economic-buyer authority when the prospect cannot justify the spend. Symmetric to the D2D dm_pts cap.' },
+          size_pts: { type: 'integer', minimum: 0, maximum: 15, description: 'Company size signal (0-15). Mid-market and up = 10-15. Enterprise 200+ = 8-15 (right size for big deal but complex sales cycle). Nano-shops (sub-10 employees) = 3-7. Sub-10-homes/yr boutique residential = 0-4 (anchor low to maintain symmetry with the "too small" Revenue caps on revenue_potential_pts and dm_access_pts).' },
           digital_pts: { type: 'integer', minimum: 0, maximum: 10, description: 'Digital presence / discoverability (0-10). Mature website + LinkedIn + press = 8-10. Placeholder website + thin online = 1-4.' }
         },
         required: ['industry_pts', 'revenue_potential_pts', 'dm_access_pts', 'size_pts', 'digital_pts']
@@ -712,13 +712,22 @@ DUAL ICP SCORING (added 2026-05-18 — supersedes any single-score guidance in t
 
 A) icp_score (REVENUE/OPPORTUNITY, 0-100, no geography)
    The pure "how big is the win if we land them" score, independent of sales-cycle difficulty.
-   Inputs and weights (sum to 100):
-     Industry fit / TerraGenie use case (0-30): construction-adjacent verticals with layout/grade-check needs score full; non-fit verticals score 0
+   Inputs and weights (max sum 105, clamped to 100):
+     Industry fit / TerraGenie use case (0-35): construction-adjacent verticals with layout/grade-check needs score full; non-fit verticals score 0
      Revenue potential (0-25): higher revenue / larger projects = higher score
      Decision-maker access (0-20): identified senior decision-maker with verified channel = full; gatekeeper-only or unknown = partial
      Company size signal (0-15): mid-market and up score full; nano-shops score lower (less capacity to pay)
      Digital presence / discoverability (0-10): mature website, LinkedIn, press = full
-   Result: a giant enterprise GC with $500M revenue scores 95+ here even if sales cycle is brutal. That is correct.
+
+   "TOO SMALL" SYMMETRY CAP (mirrors the D2D dm_pts cap):
+     When the company is "too small to support recurring TerraGenie use" (sub-10-homes/yr residential micro shops, owner-operator boutique builders with no field-pipeline, paperwork-only brokers), apply the following caps to revenue_factors regardless of the prospect's gross company revenue or reachability:
+       revenue_potential_pts: CAP at 8/25 — TerraGenie LTV depends on RECURRING field-tool use, not the prospect's company gross revenue. A small shop's revenue does not translate to TerraGenie revenue potential.
+       dm_access_pts: CAP at 8/20 — reachability does not equal economic-buyer authority when the prospect cannot justify the spend. Carlos may answer the phone, but he cannot economically commit to recurring TerraGenie.
+       size_pts: anchor at 0-4 for sub-10-homes/yr boutique residential shapes (overrides the generic "nano-shops 3-7" range).
+     Reason: a "too small" prospect is not a real revenue opportunity for TerraGenie, parallel to how a "too small" prospect is not a real D2D opportunity. Both scores should be low for the same structural reason. The "too big" / "too small" / "ideal" hierarchy by design produces: Too Big = Low D2D + High Revenue (real $ opportunity, wrong sales motion), Ideal = High D2D + High Revenue (full alignment), Too Small = Low D2D + Low Revenue (not a real opportunity either way).
+
+   Result A: a giant enterprise GC with $500M revenue scores 90+ here even if sales cycle is brutal. That is correct (too big = High Revenue / Low D2D asymmetry).
+   Result B: a sub-10-homes/yr boutique residential builder scores 25-40 here even with a verified owner contact. That is also correct (too small = Low D2D / Low Revenue symmetry per Gal's calibration ground truth).
 
 B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
    The "should a rep drive there and knock today" score. For the next 3-6 months TerraGenie wants reps spending door-knock time on the SWEET SPOT: mid-size local builders/contractors in the Orlando driving radius.
