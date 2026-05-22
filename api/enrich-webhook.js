@@ -478,14 +478,27 @@ const EMIT_ENRICHMENT_TOOL = {
       },
       d2d_factors: {
         type: 'object',
-        description: 'D2D scoring inputs. You pick the four factor values; Stage 3 code computes the final icp_score_d2d deterministically from these factors and drive_data. This is the structured replacement for picking icp_score_d2d directly. Picking the factors is your job; computing the score is the code\'s job. Aim for factor values that legitimately reflect this contact, not values reverse-engineered to hit a target score.',
+        description: 'D2D scoring inputs. You pick three factor values AND emit six observable tier_signals. Stage 3 code uses tier_signals to pick the multiplier deterministically and computes the final icp_score_d2d. You no longer pick the multiplier directly. The model picks SIGNALS; code picks the TIER.',
         properties: {
           volume_pts: { type: 'integer', minimum: 0, maximum: 30, description: 'Project volume signal (0-30). Sweet spot: mid-volume (10-100 homes/yr residential OR 5+ commercial projects/yr) scores 18-26. Tiny (<10 homes/yr) scores low (3-10). Giants score low here too (5-15 — high volume but not D2D-actionable). Infer from revenue + size + project portfolio. Unproven startups: score 8-15 (some uncertainty discount).' },
           dm_pts: { type: 'integer', minimum: 0, maximum: 20, description: 'Decision-maker accessibility (0-20). Owner/principal directly reachable = 18-20. Multi-layer org with gatekeeper = 3-8. Lead-form contact is a real decision-maker = bonus. CAP at 15/20 when company is "too small to support recurring TerraGenie use" (sub-10-homes/yr residential micro shops), regardless of how reachable the owner is.' },
           complexity_pts: { type: 'integer', minimum: 0, maximum: 15, description: 'Business operational complexity (0-15). Commercial GC / heavy civil / utility contractor / large landscape design / high-end residential = 13-15 (layout on every project). Pool builders / pure interior finish = 5-10. Mow-and-blow landscapers / paperwork brokers = 0-3.' },
-          multiplier: { type: 'number', minimum: 0, maximum: 1.0, description: 'Business-type multiplier applied to (volume_pts + dm_pts + complexity_pts). 1.00 = Mid-size residential builder (10-100 homes/yr), mid-size commercial contractor (5+ projects/yr), heavy civil / site work in sweet spot. 0.95 = Utility contractor (water/sewer/gas) in sweet spot. 0.85 = High-end landscape design / hardscape. 0.75 = Pool / outdoor structure. 0.60 = Production homebuilder (REQUIRES 50+ employees VERIFIED via Apollo/Sunbiz/website AND regional multi-community footprint; lead-form self-reported counts do not satisfy; do not apply to fast-growing sub-50-employee builders, which are 1.0x). 0.25 = Small residential GC with LOW PROJECT VOLUME (REQUIRES <10 homes/yr OR <10 projects/yr; do not apply just based on low employee count — small-team high-volume contractors are 1.0x or 0.85x depending on work mix). 0.30 = Enterprise GC (200+ employees, multi-state). 0.10 = General mow-and-blow landscaping. 0.00 = Out of vertical.' }
+          tier_signals: {
+            type: 'object',
+            description: 'Six observable signals about company shape. Code maps these to the multiplier via a deterministic decision tree. Be honest about each signal; emit null when you genuinely cannot determine one from research.',
+            properties: {
+              vertical_fit: { type: 'string', enum: ['primary', 'adjacent', 'out'], description: "primary = construction / site-work in TerraGenie's ICP (residential GC, commercial GC, heavy civil, utility, landscape design, hardscape, pool, paving, irrigation, fencing, solar ground-mount, septic, demolition). adjacent = construction-related but tangential / less field-heavy (general mow-and-blow landscaping, paperwork brokers, pure interior finish). out = unrelated (property management, insurance, retail, RE brokerage)." },
+              verified_emp_count: { type: ['integer', 'null'], description: 'Best estimate of employee count from VERIFIED sources only: Apollo person/org enrich, Sunbiz officer count, company About/Team page. Do NOT use lead-form self-reported counts. Null if no reliable verified source exists.' },
+              multi_state: { type: 'boolean', description: 'true if operations span multiple US states (Brasfield, DPR, etc). false if regional / single-state. Use project portfolio or About page to verify.' },
+              lifetime_projects: { type: ['integer', 'null'], description: 'Total projects/homes built over company history. Use portfolio page count, "about us" stat, or years_in_business × annual_homes_built. Null if no reliable signal.' },
+              annual_homes_built: { type: ['integer', 'null'], description: 'Current-year cadence in homes/projects per year. Best from explicit website language or lifetime_projects / years_in_business. Posada-shape micro builders are < 2/yr. Sweet-spot builders are 10-100/yr. Null if truly unknown.' },
+              has_luxury_signal: { type: 'boolean', description: 'true if the company shows premium-per-project signals: design awards (Parade of Homes, regional builder of the year), premium per-home pricing ($1M+ custom homes), 10+ year active track record, partnerships with named architects/interior designers, custom-home positioning. false if generic / volume / mass-market / no quality differentiation.' }
+            },
+            required: ['vertical_fit', 'multi_state', 'has_luxury_signal']
+          },
+          multiplier: { type: 'number', minimum: 0, maximum: 1.0, description: 'DEPRECATED. Stage 3 code derives the multiplier from tier_signals via a deterministic decision tree. You may echo your expected tier here for diagnostic / log purposes, but Stage 3 will override.' }
         },
-        required: ['volume_pts', 'dm_pts', 'complexity_pts', 'multiplier']
+        required: ['volume_pts', 'dm_pts', 'complexity_pts', 'tier_signals']
       },
       icp_score_d2d_breakdown: {
         type: 'string',
@@ -739,34 +752,29 @@ B) icp_score_d2d (DOOR-TO-DOOR, 0-100, geo-dominant)
      Decision-maker accessibility (0-20): owner/principal findable = full. Multi-layer org with gatekeeper = low. Lead-form contact is a real decision-maker = bonus. CAP: when the company is "too small to support recurring TerraGenie use" (sub-10-homes/yr residential, boutique micro shops with no project pipeline), cap dm_pts at 15/20 max. Reachability does not matter if the buyer cannot justify the tool — do not let easy DM access inflate the D2D score for shapes that lack commercial viability.
      Business operational complexity (0-15): companies whose work requires field layout regularly (commercial GC, heavy civil, utility, high-end residential, large-scale landscape) score full. Mow-and-blow landscapers, pure interior-only finish work, pure paperwork brokers score low.
 
-   Layer 2 — business-type multiplier (apply to base_fit before adding drive points; clamp to 0-65):
-     1.00x  Mid-size residential builder (10-100 homes/yr)
-     1.00x  Mid-size commercial contractor (5+ projects/yr)
-     1.00x  Heavy civil / site work contractor in the size sweet spot
-     0.95x  Utility contractor (water/sewer/gas) in size sweet spot
-     0.85x  High-end landscape design / hardscape (NOT general mow-and-blow)
-     0.75x  Pool / outdoor structure builder (size sweet spot)
-     0.60x  Production homebuilder (mid-to-large family-owned, 50-300 employees VERIFIED, regional single-state multi-community footprint) — bigger than sweet-spot but still field-heavy and owner/principal accessible. HARD GATE: do not apply 0.60x unless the company already has at least 50 employees VERIFIED via Apollo person/org enrich, Sunbiz officer count, or company "About"/team page. SELF-REPORTED employee counts from a lead form (e.g. "50-100 per lead form", "Mid-Market (50-100)") DO NOT COUNT — those are prospect-claimed and often inflated, especially for new LLCs. A "fast-growing" or "family-owned" builder with under 50 employees verified is NOT 0.60x; that shape is 1.0x Mid-size residential builder. Pipelines and growth potential do not promote a sub-50-employee builder into this tier. Distinguished from Enterprise GC (0.30x) by single-state footprint and family ownership keeping the decision-maker reachable.
-     0.25x  Small residential GC with LOW PROJECT VOLUME (<10 homes/yr OR <10 commercial projects/yr) — boutique builders, owner-operator with genuinely low volume; multiplier is aggressive because a low-volume buyer cannot justify recurring TerraGenie use even when geographically close. HARD GATE: do not apply 0.25x just because the company has under 10 employees; require evidence of low project volume (portfolio listing under 10 builds, "boutique" / "artisanal" / "personal-involvement" language, revenue under $1M with no high-volume signal). A small-team-high-volume contractor (e.g. 5 employees doing 950+ client jobs/yr, or commercial build-outs across multiple verticals) is NOT 0.25x; that shape is 1.0x Mid-size commercial contractor or 0.85x High-end landscape/hardscape depending on the work mix.
-     0.30x  Enterprise GC (200+ employees, multi-state, deep org chart) — too big for D2D motion
-     0.10x  General landscaping (mow-and-blow / lawn maintenance)
-     0.00x  Out of vertical (property management, insurance, retail, etc.)
+   Layer 2 — emit tier_signals; code picks the multiplier deterministically:
 
-   MULTIPLIER DISAMBIGUATION (read this when picking the multiplier — these are the two recurring miscategorizations):
+     You no longer pick the multiplier directly. You emit six observable signals about the company shape and code maps them to a tier. This is the architectural lockdown that prevents rationalizing around the rules.
 
-     Miscategorization 1: Fast-growing builder with low current employee count → 1.0x, NOT 0.60x.
-       Symptom: foundation says "11-50 employees" but also mentions "2,000-lot pipeline" or "fast-growing" or "multi-community pipeline" or "Affordable Luxury at scale".
-       Correct call: 1.0x Mid-size residential builder. The 0.60x tier is reserved for companies that HAVE ALREADY grown past 50 employees VERIFIED. Future growth or pipeline depth does not promote a sub-50-employee builder into 0.60x.
+     The six signals you emit:
+       vertical_fit:           'primary' | 'adjacent' | 'out'
+       verified_emp_count:     integer (Apollo / Sunbiz / About-page only, NOT lead-form self-reported) or null
+       multi_state:            true | false (operations span multiple US states?)
+       lifetime_projects:      integer or null (total projects built over company history)
+       annual_homes_built:     integer or null (current cadence in projects/yr)
+       has_luxury_signal:      true | false (award-winning, premium per-home, 10+yr active track, named-architect partnerships, custom-home positioning)
 
-     Miscategorization 1b: Lead-form self-reported "50-100 employees" → 1.0x, NOT 0.60x (unless verified).
-       Symptom: foundation says "Mid-Market (50-100 per lead form)" or "Small (50-100 self-reported)" but research (Apollo, Sunbiz, About page) shows much smaller actual headcount, OR the company is too new (less than 12 months old LLC) to credibly have 50+ employees, OR the brief itself contradicts the lead-form number ("likely inflated for a new LLC").
-       Correct call: 1.0x Mid-size residential builder. Treat lead-form employee counts as prospect-claimed marketing, not as verification. When the model's own research contradicts the lead-form number, the model must side with research. Self-reported numbers do not satisfy the 0.60x HARD GATE.
+     Code's decision tree (first match wins — for your understanding only, you do not implement this):
+       out of vertical                                            → 0.00
+       adjacent (mow-and-blow, paperwork)                         → 0.10
+       verified_emp_count >= 200                                  → 0.30  (Enterprise too-big)
+       verified_emp_count >= 50  (and < 200)                      → 0.60  (Production / regional)
+       annual_homes_built < 2                                     → 0.25  (boutique micro — Posada shape)
+       annual_homes_built >= 10                                   → 1.00  (sweet-spot — Phil Kean, Truemark, McNally, etc.)
+       has_luxury_signal = true (none of above fires)             → 0.85  (luxury custom builder — Budron shape)
+       default                                                    → 0.75  (specialty without strong luxury signal — pool, etc.)
 
-     Miscategorization 2: Low employee count with high project volume → 1.0x (or 0.85x), NOT 0.25x.
-       Symptom: foundation says "1-10 employees" or "Micro (1-10)" but also mentions "950+ clients served" or "high-volume" or "commercial build-outs across multiple verticals" or "BBB A+ with 5-star rating across hundreds of clients" or "subcontractor-heavy model".
-       Correct call: 1.0x Mid-size commercial contractor (if commercial mix) or 0.85x High-end landscape/hardscape (if specialty). The 0.25x tier is reserved for boutique LOW-VOLUME shapes (portfolio under 10 builds total, owner-operator with personal involvement on every job).
-
-     When employee count and project-volume signals conflict, pick the multiplier that reflects PROJECT VOLUME and CLIENT BASE, not raw employee count. Employee count is a secondary signal.
+     Be honest. The model picks SIGNALS based on research; the code picks the TIER. If you observe "Micro (1-10) employees" on the lead form but Apollo confirms 25 employees, emit verified_emp_count: 25. If a builder has been operating 20 years and won Parade of Homes but builds only 5 homes/yr, that's has_luxury_signal: true + annual_homes_built: 5 → code picks 0.85x. The math is no longer yours to argue with.
 
    Layer 3 — drive-time tier points (THIS IS A PRE-COMPUTED INTEGER IN drive_data.d2d_points_from_distance):
      The pipeline already mapped drive_time_minutes to the right tier value BEFORE you saw it. Your only job is to READ drive_data.d2d_points_from_distance and ADD it to the layer-1 result. Do NOT re-derive this from drive_time_minutes. Do NOT decide the drive lookup "failed" based on your own reading.
@@ -825,30 +833,38 @@ FACTOR-PICKING DISCIPLINE (CRITICAL — replaces the old formula-discipline sect
 
   Each factor has a legitimate range (volume 0-30, dm 0-20, complexity 0-15). Pick a value in range. Trust the math. Stop adjusting.
 
-  WORKED EXAMPLES — factor picks for common shapes (Stage 3 derives the final score from these):
+  WORKED EXAMPLES — factor picks + tier_signals for common shapes (Stage 3 derives the final score):
 
-    Sweet-spot builder (mature, Phil Kean shape — mid-size luxury custom-home GC, Orlando area):
-      d2d_factors: { volume_pts: 20, dm_pts: 18, complexity_pts: 15, multiplier: 1.00 }
-      (Stage 3 + drive: 53 × 1.0 + 35 = 88)
+    Sweet-spot builder (Phil Kean shape — mature mid-size luxury custom GC, Orlando area):
+      volume_pts: 20, dm_pts: 18, complexity_pts: 15
+      tier_signals: { vertical_fit: 'primary', verified_emp_count: 25, multi_state: false, lifetime_projects: 200, annual_homes_built: 20, has_luxury_signal: true }
+      Code picks 1.00 (annual_homes_built >= 10). Drive +35 → D2D 88.
 
-    Sweet-spot builder (young startup, Truemark shape — same business type but unproven volume):
-      d2d_factors: { volume_pts: 15, dm_pts: 18, complexity_pts: 15, multiplier: 1.00 }
-      (Stage 3 + drive: 48 × 1.0 + 35 = 83)
-      Volume gets a haircut because startups have no track record. Same complexity, same DM access.
+    Sweet-spot builder (Truemark shape — startup commercial GC, unproven volume):
+      volume_pts: 15, dm_pts: 18, complexity_pts: 15
+      tier_signals: { vertical_fit: 'primary', verified_emp_count: 8, multi_state: false, lifetime_projects: null, annual_homes_built: 12, has_luxury_signal: false }
+      Code picks 1.00. Drive +35 → D2D 83.
 
-    Enterprise GC (Hillpointe/DPR shape):
-      d2d_factors: { volume_pts: 10, dm_pts: 5, complexity_pts: 13, multiplier: 0.30 }
-      (Stage 3 + drive: round(28 × 0.30) + 35 = 8 + 35 = 43)
+    Enterprise too-big (Hillpointe/DPR/Brasfield shape):
+      volume_pts: 10, dm_pts: 5, complexity_pts: 13
+      tier_signals: { vertical_fit: 'primary', verified_emp_count: 4300, multi_state: true, lifetime_projects: null, annual_homes_built: null, has_luxury_signal: false }
+      Code picks 0.30 (verified_emp_count >= 200). Drive +35 → D2D 43.
 
-    Too small (Posada shape — boutique micro builder, sub-10-homes/yr):
-      d2d_factors: { volume_pts: 8, dm_pts: 15, complexity_pts: 13, multiplier: 0.25 }
-      (Stage 3 + drive: round(36 × 0.25) + 35 = 9 + 35 = 44)
+    Boutique micro / too-small (Posada shape — 21 projects in 35 years):
+      volume_pts: 8, dm_pts: 15, complexity_pts: 13
+      tier_signals: { vertical_fit: 'primary', verified_emp_count: 5, multi_state: false, lifetime_projects: 21, annual_homes_built: 1, has_luxury_signal: true }
+      Code picks 0.25 (annual_homes_built < 2). Drive +35 → D2D 44.
       dm_pts CAPPED at 15 even though Carlos is reachable (small-shop cap rule).
 
-    Production homebuilder (Park Square shape — mid-to-large family-owned regional builder, 50-300 employees, single-state):
-      d2d_factors: { volume_pts: 22, dm_pts: 14, complexity_pts: 14, multiplier: 0.60 }
-      (Stage 3 + drive: round(50 × 0.60) + 35 = 30 + 35 = 65)
-      Volume is solid (high project velocity), DM access is moderate (family-owned keeps the principal reachable but deeper org than sweet-spot), complexity full. Use 0.60x when the shape is bigger than mid-size sweet-spot but still single-state regional with owner/principal accessibility — distinct from 0.30x Enterprise (multi-state, deep gatekeeper layers).
+    Production homebuilder (Park Square shape — family-owned regional 50-300 emp):
+      volume_pts: 22, dm_pts: 14, complexity_pts: 14
+      tier_signals: { vertical_fit: 'primary', verified_emp_count: 160, multi_state: false, lifetime_projects: 15000, annual_homes_built: 200, has_luxury_signal: false }
+      Code picks 0.60 (verified_emp_count >= 50 + !multi_state). Drive +35 → D2D 65.
+
+    Luxury custom (Budron shape — owner-led premium builder, low volume, 20yr track):
+      volume_pts: 14, dm_pts: 18, complexity_pts: 14
+      tier_signals: { vertical_fit: 'primary', verified_emp_count: 5, multi_state: false, lifetime_projects: 100, annual_homes_built: 6, has_luxury_signal: true }
+      Code picks 0.85 (annual_homes_built >= 2 but < 10, has_luxury_signal true). Drive +35 → D2D ~74.
 
 CALIBRATION GROUND-TRUTH (use these to CHECK your factor inputs, not to override your output):
   Ideal D2D, expected D2D 85-100, Revenue 70-90:
@@ -1350,6 +1366,41 @@ async function computeDriveData(findings, businessRecord) {
   }
 }
 
+// Pick the D2D multiplier deterministically from observable signals the
+// model emitted. This is the second architectural lockdown (the first was
+// moving final-score computation into code). The model no longer chooses
+// the multiplier number — it emits six observable signals about the
+// company shape and the code maps signals to tier.
+//
+// Why this exists: when the model picked the multiplier directly from a
+// prose ladder + disambiguation rules, it would write things like
+// "HARD GATE not met but applying 0.60x anyway" — treating the rules as
+// advisory. Code-side picking removes that vector entirely. The model
+// can still get the SIGNALS wrong (e.g. claim 250 employees when Apollo
+// shows 15), but it can't game the tier choice.
+//
+// Decision tree (in order — first match wins):
+//   vertical_fit = 'out'                                  → 0.00
+//   vertical_fit = 'adjacent'                             → 0.10
+//   verified_emp_count >= 200                             → 0.30 (Enterprise)
+//   verified_emp_count >= 50                              → 0.60 (Production / regional)
+//   annual_homes_built < 2                                → 0.25 (boutique micro)
+//   annual_homes_built >= 10                              → 1.00 (sweet-spot)
+//   has_luxury_signal = true                              → 0.85 (luxury custom)
+//   default                                               → 0.75 (specialty)
+function pickMultiplier(signals) {
+  if (!signals || typeof signals !== 'object') return null;
+  const s = signals;
+  if (s.vertical_fit === 'out') return 0.00;
+  if (s.vertical_fit === 'adjacent') return 0.10;
+  if (typeof s.verified_emp_count === 'number' && s.verified_emp_count >= 200) return 0.30;
+  if (typeof s.verified_emp_count === 'number' && s.verified_emp_count >= 50) return 0.60;
+  if (typeof s.annual_homes_built === 'number' && s.annual_homes_built < 2) return 0.25;
+  if (typeof s.annual_homes_built === 'number' && s.annual_homes_built >= 10) return 1.00;
+  if (s.has_luxury_signal === true) return 0.85;
+  return 0.75;
+}
+
 // Compute icp_score_d2d and icp_score deterministically from the factor
 // values the model emitted. This is the architectural fix for the field/text
 // mismatch bug observed during calibration — the model can write inconsistent
@@ -1368,22 +1419,43 @@ function recomputeScoresFromFactors(enrichment, driveData) {
   const result = { ...enrichment };
 
   // D2D — derive from d2d_factors + drive_data.d2d_points_from_distance
+  // Multiplier: prefer code-derived from tier_signals (new architectural lockdown),
+  // fall back to model-emitted multiplier for backward compat.
   const d2d = enrichment.d2d_factors;
   if (d2d && typeof d2d.volume_pts === 'number'
         && typeof d2d.dm_pts === 'number'
-        && typeof d2d.complexity_pts === 'number'
-        && typeof d2d.multiplier === 'number') {
-    const base = d2d.volume_pts + d2d.dm_pts + d2d.complexity_pts;
-    const layer1 = Math.round(base * d2d.multiplier);
-    const drivePts = (driveData && typeof driveData.d2d_points_from_distance === 'number')
-      ? driveData.d2d_points_from_distance
-      : 0;
-    const computed = Math.max(0, Math.min(100, layer1 + drivePts));
-    if (enrichment.icp_score_d2d != null && enrichment.icp_score_d2d !== computed) {
-      console.warn(`[scores] icp_score_d2d: model emitted ${enrichment.icp_score_d2d}, code computed ${computed} from factors (volume=${d2d.volume_pts} dm=${d2d.dm_pts} complexity=${d2d.complexity_pts} ×${d2d.multiplier} +${drivePts}drive); using computed value`);
+        && typeof d2d.complexity_pts === 'number') {
+    let multiplier;
+    let multiplierSource;
+    const signalDerived = pickMultiplier(d2d.tier_signals);
+    if (signalDerived != null) {
+      multiplier = signalDerived;
+      multiplierSource = 'code-derived from tier_signals';
+      if (typeof d2d.multiplier === 'number' && d2d.multiplier !== signalDerived) {
+        console.warn(`[scores] multiplier divergence: model emitted ${d2d.multiplier}, signals yield ${signalDerived}; using ${signalDerived}. Signals: ${JSON.stringify(d2d.tier_signals)}`);
+      }
+    } else if (typeof d2d.multiplier === 'number') {
+      multiplier = d2d.multiplier;
+      multiplierSource = 'model-emitted fallback (no tier_signals)';
+      console.warn(`[scores] no tier_signals provided; falling back to model-emitted multiplier=${d2d.multiplier}`);
+    } else {
+      console.warn(`[scores] d2d_factors has no tier_signals AND no multiplier; falling back to model-emitted icp_score_d2d=${enrichment.icp_score_d2d}`);
+      // Fall through — model-emitted icp_score_d2d stays
+      multiplier = null;
     }
-    result.icp_score_d2d = computed;
-    result._d2d_computed_breakdown = `volume_pts=${d2d.volume_pts} + dm_pts=${d2d.dm_pts} + complexity_pts=${d2d.complexity_pts} = ${base} base, × ${d2d.multiplier} multiplier = ${layer1} layer1, + ${drivePts} drive = ${computed}`;
+    if (multiplier != null) {
+      const base = d2d.volume_pts + d2d.dm_pts + d2d.complexity_pts;
+      const layer1 = Math.round(base * multiplier);
+      const drivePts = (driveData && typeof driveData.d2d_points_from_distance === 'number')
+        ? driveData.d2d_points_from_distance
+        : 0;
+      const computed = Math.max(0, Math.min(100, layer1 + drivePts));
+      if (enrichment.icp_score_d2d != null && enrichment.icp_score_d2d !== computed) {
+        console.warn(`[scores] icp_score_d2d: model emitted ${enrichment.icp_score_d2d}, code computed ${computed} from factors (volume=${d2d.volume_pts} dm=${d2d.dm_pts} complexity=${d2d.complexity_pts} ×${multiplier} [${multiplierSource}] +${drivePts}drive); using computed value`);
+      }
+      result.icp_score_d2d = computed;
+      result._d2d_computed_breakdown = `volume_pts=${d2d.volume_pts} + dm_pts=${d2d.dm_pts} + complexity_pts=${d2d.complexity_pts} = ${base} base, × ${multiplier} multiplier [${multiplierSource}] = ${layer1} layer1, + ${drivePts} drive = ${computed}`;
+    }
   } else {
     console.warn(`[scores] d2d_factors missing or incomplete on enrichment; falling back to model-emitted icp_score_d2d=${enrichment.icp_score_d2d}`);
   }
