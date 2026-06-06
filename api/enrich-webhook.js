@@ -150,6 +150,14 @@ function buildContactCustomFieldsArray(values) {
   return arr;
 }
 
+// True only for strings shaped like a real email address. Used to keep
+// deliverability labels ("Catch-All", "Valid", "Unverified", "Not on file")
+// out of the email fields — the model occasionally emits the Apollo
+// deliverability classification into verified_email instead of the address.
+function isEmailAddress(s) {
+  return typeof s === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s.trim());
+}
+
 // ─── External research tool executors (Apollo, Firecrawl) ──────────────────
 
 async function execApolloPeopleMatch(input) {
@@ -569,7 +577,7 @@ const EMIT_ENRICHMENT_TOOL = {
           linkedin_url: { type: 'string' },
           industry: { type: 'string', enum: ['Construction', 'Surveyors', 'Infrastructure Detectors', 'Landscape or Playgrounds', 'Pools', 'Other', ''] },
           decision_maker: { type: 'string', enum: ['Yes', 'No', 'Unknown', 'Gatekeeper', ''] },
-          verified_email: { type: 'string' },
+          verified_email: { type: 'string', description: 'The decision-maker email ADDRESS (e.g. "jane@acme.com"), empty string if none found. Never put a deliverability label here ("Catch-All", "Valid", "Unverified") — that is not an address. Stage 3 mirrors a valid address into the native email field too.' },
           contact_source: { type: 'string', description: 'Only set if currently empty in GHL. Stage 3 enforces preservation.' },
           company_size_tier: { type: 'string' },
           revenue_tier: { type: 'string' },
@@ -1831,7 +1839,7 @@ function formatBrief(enrichment, { contactName, companyName }) {
 
 // ─── Stage 3: Writeback ────────────────────────────────────────────────────
 
-async function writeContactFields({ contactId, enrichment, existingContactSource, existingCommunicationMemory }) {
+async function writeContactFields({ contactId, enrichment, existingContactSource, existingCommunicationMemory, existingContactEmail }) {
   const today = new Date().toISOString().slice(0, 10);
   const cf = enrichment.contact_fields || {};
   const corr = enrichment.name_corrections || {};
@@ -1896,12 +1904,36 @@ async function writeContactFields({ contactId, enrichment, existingContactSource
     fieldValues.enrichment_source = 'AI Synthesis';
   }
 
+  // Email hygiene (writeback fix):
+  // (1) verified_email must be a real address. If the model emitted a
+  //     deliverability label ("Catch-All", "Valid", etc.) instead of the
+  //     address, drop it so we never write junk into the email field.
+  // (2) Mirror a valid verified email into the native `email` field when the
+  //     contact has none. Outreach tools, workflows, and the contact-list
+  //     Email column read the NATIVE field, not the verified_email custom
+  //     field, so a verified email that lives only in the custom field looks
+  //     like no email at all. Never clobber an existing (e.g. lead-form) email.
+  let validVerifiedEmail = null;
+  if (fieldValues.verified_email) {
+    if (isEmailAddress(fieldValues.verified_email)) {
+      validVerifiedEmail = String(fieldValues.verified_email).trim();
+      fieldValues.verified_email = validVerifiedEmail;
+    } else {
+      console.warn(`[writeback] verified_email "${fieldValues.verified_email}" is not an address (likely a deliverability label); dropping it`);
+      delete fieldValues.verified_email;
+    }
+  }
+
   const customFields = buildContactCustomFieldsArray(fieldValues);
 
   const payload = { customFields };
   if (corr.first_name) payload.firstName = corr.first_name;
   if (corr.last_name) payload.lastName = corr.last_name;
   if (corr.company_name) payload.companyName = corr.company_name;
+  if (validVerifiedEmail && !(existingContactEmail && String(existingContactEmail).trim())) {
+    payload.email = validVerifiedEmail;
+    console.log(`[writeback] mirrored verified email into native email field for ${contactId}`);
+  }
 
   return ghlUpdateContact(contactId, payload);
 }
@@ -1941,6 +1973,7 @@ async function runWriteback({ contactId, contactRecord, enrichment }) {
   const contact = (contactRecord && contactRecord.contact) || {};
   const businessId = contact.businessId || null;
   const existingContactSource = contact.source || null;
+  const existingContactEmail = contact.email || null;
   const existingCommunicationMemory = readContactCustomField(contactRecord, 'communication_memory');
   const corr = enrichment.name_corrections || {};
   const contactName = [
@@ -1953,7 +1986,7 @@ async function runWriteback({ contactId, contactRecord, enrichment }) {
   // does not block the others — collect results and downgrade status if any
   // failed.
   const [contactResult, businessResult, noteResult] = await Promise.allSettled([
-    writeContactFields({ contactId, enrichment, existingContactSource, existingCommunicationMemory }),
+    writeContactFields({ contactId, enrichment, existingContactSource, existingCommunicationMemory, existingContactEmail }),
     writeBusinessFields({ businessId, enrichment }),
     createPreCallBriefNote({ contactId, enrichment, contactName, companyName })
   ]);
